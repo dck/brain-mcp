@@ -1,1 +1,3 @@
-// brain-mcp-proto: MCP protocol types and handlers
+pub mod handler;
+pub mod jsonrpc;
+pub mod schema;
