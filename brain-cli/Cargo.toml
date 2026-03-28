@@ -9,9 +9,9 @@ path = "src/main.rs"
 
 [dependencies]
 brain-core = { workspace = true }
-brain-vault = { path = "../brain-vault" }
-brain-embed = { path = "../brain-embed" }
-brain-index = { path = "../brain-index" }
+brain-vault = { workspace = true }
+brain-embed = { workspace = true }
+brain-index = { workspace = true }
 brain-mcp-proto = { workspace = true }
 brain-server = { workspace = true }
 serde = { workspace = true }
