@@ -1,1 +1,1 @@
-// brain-index: sqlite-backed search index
+pub mod adapter;
