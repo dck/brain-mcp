@@ -25,6 +25,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Interactive first-time setup
+    Init,
     /// Start the memory server
     Serve {
         /// Run in background
@@ -43,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Commands::Init => commands::init::run(cli.json).await,
         Commands::Serve { daemonize } => commands::serve::run(cli.config, daemonize).await,
         Commands::Status => commands::status::run(cli.json).await,
     }
