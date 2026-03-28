@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{Json, Router, extract::State, routing::post};
 use brain_mcp_proto::handler::McpHandler;
 use brain_mcp_proto::jsonrpc::{Request, Response};
 use tokio::sync::watch;

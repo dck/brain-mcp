@@ -1,9 +1,8 @@
-use async_trait::async_trait;
 use brain_core::error::BrainError;
 use reqwest::Client;
 use serde::Deserialize;
 
-use brain_core::ports::EmbeddingPort;
+use brain_core::ports::{BoxFuture, EmbeddingPort};
 
 pub struct OpenAiEmbedder {
     client: Client,
@@ -38,46 +37,48 @@ struct EmbeddingData {
     embedding: Vec<f32>,
 }
 
-#[async_trait]
 impl EmbeddingPort for OpenAiEmbedder {
-    async fn embed(&self, text: &str) -> brain_core::error::Result<Vec<f32>> {
-        let url = format!("{}/v1/embeddings", self.base_url);
-        let body = serde_json::json!({
-            "input": text,
-            "model": self.model,
-        });
+    fn embed(&self, text: &str) -> BoxFuture<'_, brain_core::error::Result<Vec<f32>>> {
+        let text = text.to_string();
+        Box::pin(async move {
+            let url = format!("{}/v1/embeddings", self.base_url);
+            let body = serde_json::json!({
+                "input": text,
+                "model": self.model,
+            });
 
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| BrainError::Embedding(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp
-                .text()
+            let resp = self
+                .client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .json(&body)
+                .send()
                 .await
-                .unwrap_or_else(|_| "failed to read body".into());
-            return Err(BrainError::Embedding(format!(
-                "API returned {status}: {body}"
-            )));
-        }
+                .map_err(|e| BrainError::Embedding(e.to_string()))?;
 
-        let parsed: EmbeddingResponse = resp
-            .json()
-            .await
-            .map_err(|e| BrainError::Embedding(e.to_string()))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "failed to read body".into());
+                return Err(BrainError::Embedding(format!(
+                    "API returned {status}: {body}"
+                )));
+            }
 
-        parsed
-            .data
-            .into_iter()
-            .next()
-            .map(|d| d.embedding)
-            .ok_or_else(|| BrainError::Embedding("empty response data".into()))
+            let parsed: EmbeddingResponse = resp
+                .json()
+                .await
+                .map_err(|e| BrainError::Embedding(e.to_string()))?;
+
+            parsed
+                .data
+                .into_iter()
+                .next()
+                .map(|d| d.embedding)
+                .ok_or_else(|| BrainError::Embedding("empty response data".into()))
+        })
     }
 
     fn dimensions(&self) -> usize {

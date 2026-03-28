@@ -1,13 +1,12 @@
 use std::path::Path;
 
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use tokio::sync::Mutex;
 
 use brain_core::error::{BrainError, Result};
 use brain_core::model::{Filter, Memory, Metadata, SearchResult};
-use brain_core::ports::IndexPort;
+use brain_core::ports::{BoxFuture, IndexPort};
 
 pub struct SqliteVecIndex {
     conn: Mutex<Connection>,
@@ -76,20 +75,20 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn matches_filter(meta: &Metadata, filter: &Filter) -> bool {
-    if let Some(ref cat) = filter.category {
-        if meta.category != *cat {
-            return false;
-        }
+    if let Some(ref cat) = filter.category
+        && meta.category != *cat
+    {
+        return false;
     }
-    if let Some(ref proj) = filter.project {
-        if meta.project.as_deref() != Some(proj.as_str()) {
-            return false;
-        }
+    if let Some(ref proj) = filter.project
+        && meta.project.as_deref() != Some(proj.as_str())
+    {
+        return false;
     }
-    if let Some(ref since) = filter.since {
-        if meta.created_at < *since {
-            return false;
-        }
+    if let Some(ref since) = filter.since
+        && meta.created_at < *since
+    {
+        return false;
     }
     if let Some(ref tags) = filter.tags {
         for tag in tags {
@@ -122,154 +121,181 @@ fn row_to_metadata(row: &rusqlite::Row<'_>) -> rusqlite::Result<Metadata> {
     })
 }
 
-#[async_trait]
 impl IndexPort for SqliteVecIndex {
-    async fn upsert(&self, id: &str, embedding: &[f32], metadata: &Metadata) -> Result<()> {
-        let conn = self.conn.lock().await;
-        let tags_json =
-            serde_json::to_string(&metadata.tags).map_err(|e| BrainError::Index(e.to_string()))?;
-        let created_at_str = metadata.created_at.to_rfc3339();
-        let blob = f32_slice_to_bytes(embedding);
+    fn upsert(
+        &self,
+        id: &str,
+        embedding: &[f32],
+        metadata: &Metadata,
+    ) -> BoxFuture<'_, Result<()>> {
+        let id = id.to_string();
+        let embedding = embedding.to_vec();
+        let metadata = metadata.clone();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let tags_json = serde_json::to_string(&metadata.tags)
+                .map_err(|e| BrainError::Index(e.to_string()))?;
+            let created_at_str = metadata.created_at.to_rfc3339();
+            let blob = f32_slice_to_bytes(&embedding);
 
-        conn.execute(
-            "INSERT OR REPLACE INTO memories (id, title, tags, category, project, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![id, metadata.title, tags_json, metadata.category, metadata.project, created_at_str],
-        ).map_err(|e| BrainError::Index(e.to_string()))?;
+            conn.execute(
+                "INSERT OR REPLACE INTO memories (id, title, tags, category, project, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![id, metadata.title, tags_json, metadata.category, metadata.project, created_at_str],
+            ).map_err(|e| BrainError::Index(e.to_string()))?;
 
-        conn.execute(
-            "INSERT OR REPLACE INTO memory_vectors (id, embedding) VALUES (?1, ?2)",
-            rusqlite::params![id, blob],
-        )
-        .map_err(|e| BrainError::Index(e.to_string()))?;
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_vectors (id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![id, blob],
+            )
+            .map_err(|e| BrainError::Index(e.to_string()))?;
 
-        Ok(())
+            Ok(())
+        })
     }
 
-    async fn search(
+    fn search(
         &self,
         embedding: &[f32],
         limit: usize,
         filter: &Filter,
-    ) -> Result<Vec<SearchResult>> {
-        let conn = self.conn.lock().await;
+    ) -> BoxFuture<'_, Result<Vec<SearchResult>>> {
+        let embedding = embedding.to_vec();
+        let filter = filter.clone();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
 
-        // Load all vectors
-        let mut stmt = conn
-            .prepare("SELECT id, embedding FROM memory_vectors")
-            .map_err(|e| BrainError::Index(e.to_string()))?;
-
-        let scored: Vec<(String, f32)> = stmt
-            .query_map([], |row| {
-                let id: String = row.get(0)?;
-                let blob: Vec<u8> = row.get(1)?;
-                Ok((id, blob))
-            })
-            .map_err(|e| BrainError::Index(e.to_string()))?
-            .filter_map(|r| r.ok())
-            .map(|(id, blob)| {
-                let vec = bytes_to_f32_vec(&blob);
-                let score = cosine_similarity(embedding, &vec);
-                (id, score)
-            })
-            .collect();
-
-        // Sort descending by score
-        let mut scored = scored;
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        // For each candidate, load metadata, apply filter, collect up to limit
-        let mut results = Vec::new();
-        for (id, score) in scored {
-            if results.len() >= limit {
-                break;
-            }
-
-            let meta = conn
-                .query_row(
-                    "SELECT id, title, tags, category, project, created_at FROM memories WHERE id = ?1",
-                    rusqlite::params![id],
-                    row_to_metadata,
-                )
+            // Load all vectors
+            let mut stmt = conn
+                .prepare("SELECT id, embedding FROM memory_vectors")
                 .map_err(|e| BrainError::Index(e.to_string()))?;
 
-            if !matches_filter(&meta, filter) {
-                continue;
+            let scored: Vec<(String, f32)> = stmt
+                .query_map([], |row| {
+                    let id: String = row.get(0)?;
+                    let blob: Vec<u8> = row.get(1)?;
+                    Ok((id, blob))
+                })
+                .map_err(|e| BrainError::Index(e.to_string()))?
+                .filter_map(|r| r.ok())
+                .map(|(id, blob)| {
+                    let vec = bytes_to_f32_vec(&blob);
+                    let score = cosine_similarity(&embedding, &vec);
+                    (id, score)
+                })
+                .collect();
+
+            // Sort descending by score
+            let mut scored = scored;
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            // For each candidate, load metadata, apply filter, collect up to limit
+            let mut results = Vec::new();
+            for (id, score) in scored {
+                if results.len() >= limit {
+                    break;
+                }
+
+                let meta = conn
+                    .query_row(
+                        "SELECT id, title, tags, category, project, created_at FROM memories WHERE id = ?1",
+                        rusqlite::params![id],
+                        row_to_metadata,
+                    )
+                    .map_err(|e| BrainError::Index(e.to_string()))?;
+
+                if !matches_filter(&meta, &filter) {
+                    continue;
+                }
+
+                results.push(SearchResult {
+                    memory: Memory {
+                        id: meta.id,
+                        title: meta.title,
+                        content: String::new(),
+                        tags: meta.tags,
+                        category: meta.category,
+                        project: meta.project,
+                        created_at: meta.created_at,
+                    },
+                    score,
+                });
             }
 
-            results.push(SearchResult {
-                memory: Memory {
-                    id: meta.id,
-                    title: meta.title,
-                    content: String::new(),
-                    tags: meta.tags,
-                    category: meta.category,
-                    project: meta.project,
-                    created_at: meta.created_at,
-                },
-                score,
-            });
-        }
-
-        Ok(results)
+            Ok(results)
+        })
     }
 
-    async fn delete(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().await;
-        conn.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])
+    fn delete(&self, id: &str) -> BoxFuture<'_, Result<()>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            conn.execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])
+                .map_err(|e| BrainError::Index(e.to_string()))?;
+            conn.execute(
+                "DELETE FROM memory_vectors WHERE id = ?1",
+                rusqlite::params![id],
+            )
             .map_err(|e| BrainError::Index(e.to_string()))?;
-        conn.execute(
-            "DELETE FROM memory_vectors WHERE id = ?1",
-            rusqlite::params![id],
-        )
-        .map_err(|e| BrainError::Index(e.to_string()))?;
-        Ok(())
+            Ok(())
+        })
     }
 
-    async fn list(&self, filter: &Filter) -> Result<Vec<Metadata>> {
-        let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare("SELECT id, title, tags, category, project, created_at FROM memories")
+    fn list(&self, filter: &Filter) -> BoxFuture<'_, Result<Vec<Metadata>>> {
+        let filter = filter.clone();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let mut stmt = conn
+                .prepare("SELECT id, title, tags, category, project, created_at FROM memories")
+                .map_err(|e| BrainError::Index(e.to_string()))?;
+
+            let all: Vec<Metadata> = stmt
+                .query_map([], row_to_metadata)
+                .map_err(|e| BrainError::Index(e.to_string()))?
+                .filter_map(|r| r.ok())
+                .filter(|meta| matches_filter(meta, &filter))
+                .collect();
+
+            Ok(all)
+        })
+    }
+
+    fn clear(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            conn.execute("DELETE FROM memories", [])
+                .map_err(|e| BrainError::Index(e.to_string()))?;
+            conn.execute("DELETE FROM memory_vectors", [])
+                .map_err(|e| BrainError::Index(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn stored_model_id(&self) -> BoxFuture<'_, Result<Option<String>>> {
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let result =
+                conn.query_row("SELECT value FROM meta WHERE key = 'model_id'", [], |row| {
+                    row.get(0)
+                });
+            match result {
+                Ok(val) => Ok(Some(val)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(BrainError::Index(e.to_string())),
+            }
+        })
+    }
+
+    fn set_model_id(&self, model_id: &str) -> BoxFuture<'_, Result<()>> {
+        let model_id = model_id.to_string();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('model_id', ?1)",
+                rusqlite::params![model_id],
+            )
             .map_err(|e| BrainError::Index(e.to_string()))?;
-
-        let all: Vec<Metadata> = stmt
-            .query_map([], row_to_metadata)
-            .map_err(|e| BrainError::Index(e.to_string()))?
-            .filter_map(|r| r.ok())
-            .filter(|meta| matches_filter(meta, filter))
-            .collect();
-
-        Ok(all)
-    }
-
-    async fn clear(&self) -> Result<()> {
-        let conn = self.conn.lock().await;
-        conn.execute("DELETE FROM memories", [])
-            .map_err(|e| BrainError::Index(e.to_string()))?;
-        conn.execute("DELETE FROM memory_vectors", [])
-            .map_err(|e| BrainError::Index(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn stored_model_id(&self) -> Result<Option<String>> {
-        let conn = self.conn.lock().await;
-        let result = conn.query_row("SELECT value FROM meta WHERE key = 'model_id'", [], |row| {
-            row.get(0)
-        });
-        match result {
-            Ok(val) => Ok(Some(val)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(BrainError::Index(e.to_string())),
-        }
-    }
-
-    async fn set_model_id(&self, model_id: &str) -> Result<()> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('model_id', ?1)",
-            rusqlite::params![model_id],
-        )
-        .map_err(|e| BrainError::Index(e.to_string()))?;
-        Ok(())
+            Ok(())
+        })
     }
 }
 

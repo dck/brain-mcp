@@ -6,7 +6,7 @@ use brain_core::error::BrainError;
 use brain_core::model::Filter;
 use brain_core::service::MemoryService;
 
-use crate::jsonrpc::{Request, Response, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND};
+use crate::jsonrpc::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND, Request, Response};
 use crate::schema::tool_definitions;
 
 pub struct McpHandler {
@@ -76,7 +76,7 @@ impl McpHandler {
                     request.id,
                     METHOD_NOT_FOUND,
                     format!("Unknown tool: {name}"),
-                )
+                );
             }
         };
 

@@ -1,11 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use async_trait::async_trait;
-
 use crate::error::Result;
 use crate::model::{Filter, Memory, Metadata, SearchResult};
-use crate::ports::{EmbeddingPort, IndexPort, VaultPort};
+use crate::ports::{BoxFuture, EmbeddingPort, IndexPort, VaultPort};
 
 // ---------------------------------------------------------------------------
 // MockVault
@@ -29,27 +27,30 @@ impl Default for MockVault {
     }
 }
 
-#[async_trait]
 impl VaultPort for MockVault {
-    async fn write(&self, memory: &Memory) -> Result<()> {
-        self.store
-            .lock()
-            .unwrap()
-            .insert(memory.id.clone(), memory.clone());
-        Ok(())
+    fn write(&self, memory: &Memory) -> BoxFuture<'_, Result<()>> {
+        let memory = memory.clone();
+        Box::pin(async move {
+            self.store.lock().unwrap().insert(memory.id.clone(), memory);
+            Ok(())
+        })
     }
 
-    async fn read(&self, id: &str) -> Result<Option<Memory>> {
-        Ok(self.store.lock().unwrap().get(id).cloned())
+    fn read(&self, id: &str) -> BoxFuture<'_, Result<Option<Memory>>> {
+        let id = id.to_string();
+        Box::pin(async move { Ok(self.store.lock().unwrap().get(&id).cloned()) })
     }
 
-    async fn delete(&self, id: &str) -> Result<()> {
-        self.store.lock().unwrap().remove(id);
-        Ok(())
+    fn delete(&self, id: &str) -> BoxFuture<'_, Result<()>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            self.store.lock().unwrap().remove(&id);
+            Ok(())
+        })
     }
 
-    async fn list_all(&self) -> Result<Vec<Memory>> {
-        Ok(self.store.lock().unwrap().values().cloned().collect())
+    fn list_all(&self) -> BoxFuture<'_, Result<Vec<Memory>>> {
+        Box::pin(async move { Ok(self.store.lock().unwrap().values().cloned().collect()) })
     }
 }
 
@@ -76,11 +77,13 @@ impl MockEmbedder {
     }
 }
 
-#[async_trait]
 impl EmbeddingPort for MockEmbedder {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        self.calls.lock().unwrap().push(text.to_string());
-        Ok(deterministic_vector(text, self.dims))
+    fn embed(&self, text: &str) -> BoxFuture<'_, Result<Vec<f32>>> {
+        let text = text.to_string();
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(text.clone());
+            Ok(deterministic_vector(&text, self.dims))
+        })
     }
 
     fn dimensions(&self) -> usize {
@@ -129,97 +132,118 @@ impl Default for MockIndex {
     }
 }
 
-#[async_trait]
 impl IndexPort for MockIndex {
-    async fn upsert(&self, id: &str, embedding: &[f32], metadata: &Metadata) -> Result<()> {
-        self.store
-            .lock()
-            .unwrap()
-            .insert(id.to_string(), (embedding.to_vec(), metadata.clone()));
-        Ok(())
+    fn upsert(
+        &self,
+        id: &str,
+        embedding: &[f32],
+        metadata: &Metadata,
+    ) -> BoxFuture<'_, Result<()>> {
+        let id = id.to_string();
+        let embedding = embedding.to_vec();
+        let metadata = metadata.clone();
+        Box::pin(async move {
+            self.store.lock().unwrap().insert(id, (embedding, metadata));
+            Ok(())
+        })
     }
 
-    async fn search(
+    fn search(
         &self,
         embedding: &[f32],
         limit: usize,
         filter: &Filter,
-    ) -> Result<Vec<SearchResult>> {
-        let store = self.store.lock().unwrap();
-        let mut scored: Vec<(f32, &Metadata)> = store
-            .values()
-            .filter(|(_, meta)| matches_filter(meta, filter))
-            .map(|(vec, meta)| (cosine_similarity(embedding, vec), meta))
-            .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(limit);
-        Ok(scored
-            .into_iter()
-            .map(|(score, meta)| SearchResult {
-                memory: Memory {
-                    id: meta.id.clone(),
-                    title: meta.title.clone(),
-                    content: String::new(), // placeholder — service hydrates from vault
-                    tags: meta.tags.clone(),
-                    category: meta.category.clone(),
-                    project: meta.project.clone(),
-                    created_at: meta.created_at,
-                },
-                score,
-            })
-            .collect())
+    ) -> BoxFuture<'_, Result<Vec<SearchResult>>> {
+        let embedding = embedding.to_vec();
+        let filter = filter.clone();
+        Box::pin(async move {
+            let store = self.store.lock().unwrap();
+            let mut scored: Vec<(f32, &Metadata)> = store
+                .values()
+                .filter(|(_, meta)| matches_filter(meta, &filter))
+                .map(|(vec, meta)| (cosine_similarity(&embedding, vec), meta))
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(limit);
+            Ok(scored
+                .into_iter()
+                .map(|(score, meta)| SearchResult {
+                    memory: Memory {
+                        id: meta.id.clone(),
+                        title: meta.title.clone(),
+                        content: String::new(), // placeholder — service hydrates from vault
+                        tags: meta.tags.clone(),
+                        category: meta.category.clone(),
+                        project: meta.project.clone(),
+                        created_at: meta.created_at,
+                    },
+                    score,
+                })
+                .collect())
+        })
     }
 
-    async fn delete(&self, id: &str) -> Result<()> {
-        self.store.lock().unwrap().remove(id);
-        Ok(())
+    fn delete(&self, id: &str) -> BoxFuture<'_, Result<()>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            self.store.lock().unwrap().remove(&id);
+            Ok(())
+        })
     }
 
-    async fn list(&self, filter: &Filter) -> Result<Vec<Metadata>> {
-        let store = self.store.lock().unwrap();
-        Ok(store
-            .values()
-            .map(|(_, meta)| meta)
-            .filter(|meta| matches_filter(meta, filter))
-            .cloned()
-            .collect())
+    fn list(&self, filter: &Filter) -> BoxFuture<'_, Result<Vec<Metadata>>> {
+        let filter = filter.clone();
+        Box::pin(async move {
+            let store = self.store.lock().unwrap();
+            Ok(store
+                .values()
+                .map(|(_, meta)| meta)
+                .filter(|meta| matches_filter(meta, &filter))
+                .cloned()
+                .collect())
+        })
     }
 
-    async fn clear(&self) -> Result<()> {
-        self.store.lock().unwrap().clear();
-        Ok(())
+    fn clear(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.store.lock().unwrap().clear();
+            Ok(())
+        })
     }
 
-    async fn stored_model_id(&self) -> Result<Option<String>> {
-        Ok(self.model_id.lock().unwrap().clone())
+    fn stored_model_id(&self) -> BoxFuture<'_, Result<Option<String>>> {
+        Box::pin(async move { Ok(self.model_id.lock().unwrap().clone()) })
     }
 
-    async fn set_model_id(&self, model_id: &str) -> Result<()> {
-        *self.model_id.lock().unwrap() = Some(model_id.to_string());
-        Ok(())
+    fn set_model_id(&self, model_id: &str) -> BoxFuture<'_, Result<()>> {
+        let model_id = model_id.to_string();
+        Box::pin(async move {
+            *self.model_id.lock().unwrap() = Some(model_id);
+            Ok(())
+        })
     }
 }
 
 fn matches_filter(meta: &Metadata, filter: &Filter) -> bool {
-    if let Some(cat) = &filter.category {
-        if &meta.category != cat {
-            return false;
-        }
+    if let Some(cat) = &filter.category
+        && &meta.category != cat
+    {
+        return false;
     }
-    if let Some(proj) = &filter.project {
-        if meta.project.as_ref() != Some(proj) {
-            return false;
-        }
+    if let Some(proj) = &filter.project
+        && meta.project.as_ref() != Some(proj)
+    {
+        return false;
     }
-    if let Some(tags) = &filter.tags {
-        if !tags.iter().any(|t| meta.tags.contains(t)) {
-            return false;
-        }
+    if let Some(tags) = &filter.tags
+        && !tags.iter().any(|t| meta.tags.contains(t))
+    {
+        return false;
     }
-    if let Some(since) = &filter.since {
-        if meta.created_at < *since {
-            return false;
-        }
+    if let Some(since) = &filter.since
+        && meta.created_at < *since
+    {
+        return false;
     }
     true
 }

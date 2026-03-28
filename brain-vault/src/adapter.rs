@@ -1,9 +1,8 @@
 use std::path::PathBuf;
 
-use async_trait::async_trait;
 use brain_core::error::{BrainError, Result};
 use brain_core::model::Memory;
-use brain_core::ports::VaultPort;
+use brain_core::ports::{BoxFuture, VaultPort};
 use tracing::warn;
 
 use crate::frontmatter::{parse_markdown, to_markdown};
@@ -51,88 +50,99 @@ impl VaultAdapter {
     }
 }
 
-#[async_trait]
 impl VaultPort for VaultAdapter {
-    async fn write(&self, memory: &Memory) -> Result<()> {
-        let content = match load_template(&self.vault_path, &self.templates_dir, &memory.category) {
-            Some(template) => apply_template(&template, memory),
-            None => to_markdown(memory),
-        };
+    fn write(&self, memory: &Memory) -> BoxFuture<'_, Result<()>> {
+        let memory = memory.clone();
+        Box::pin(async move {
+            let content =
+                match load_template(&self.vault_path, &self.templates_dir, &memory.category) {
+                    Some(template) => apply_template(&template, &memory),
+                    None => to_markdown(&memory),
+                };
 
-        let path = self.memory_path(&memory.category, &memory.id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| BrainError::Vault(format!("failed to create directory: {e}")))?;
-        }
-
-        std::fs::write(&path, content)
-            .map_err(|e| BrainError::Vault(format!("failed to write file: {e}")))?;
-
-        Ok(())
-    }
-
-    async fn read(&self, id: &str) -> Result<Option<Memory>> {
-        let path = match self.find_file(id) {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| BrainError::Vault(format!("failed to read file: {e}")))?;
-
-        let memory = parse_markdown(&text)?;
-        Ok(Some(memory))
-    }
-
-    async fn delete(&self, id: &str) -> Result<()> {
-        if let Some(path) = self.find_file(id) {
-            std::fs::remove_file(&path)
-                .map_err(|e| BrainError::Vault(format!("failed to delete file: {e}")))?;
-        }
-        Ok(())
-    }
-
-    async fn list_all(&self) -> Result<Vec<Memory>> {
-        let mut memories = Vec::new();
-
-        let entries = std::fs::read_dir(&self.vault_path)
-            .map_err(|e| BrainError::Vault(format!("failed to read vault directory: {e}")))?;
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let dir_name = entry.file_name();
-            let dir_name = dir_name.to_string_lossy();
-            if dir_name.starts_with('.') || dir_name.starts_with('_') {
-                continue;
+            let path = self.memory_path(&memory.category, &memory.id);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| BrainError::Vault(format!("failed to create directory: {e}")))?;
             }
 
-            let sub_entries = match std::fs::read_dir(&path) {
-                Ok(e) => e,
-                Err(_) => continue,
+            std::fs::write(&path, content)
+                .map_err(|e| BrainError::Vault(format!("failed to write file: {e}")))?;
+
+            Ok(())
+        })
+    }
+
+    fn read(&self, id: &str) -> BoxFuture<'_, Result<Option<Memory>>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let path = match self.find_file(&id) {
+                Some(p) => p,
+                None => return Ok(None),
             };
 
-            for sub_entry in sub_entries.flatten() {
-                let file_path = sub_entry.path();
-                if file_path.extension().is_some_and(|ext| ext == "md") {
-                    match std::fs::read_to_string(&file_path) {
-                        Ok(text) => match parse_markdown(&text) {
-                            Ok(memory) => memories.push(memory),
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| BrainError::Vault(format!("failed to read file: {e}")))?;
+
+            let memory = parse_markdown(&text)?;
+            Ok(Some(memory))
+        })
+    }
+
+    fn delete(&self, id: &str) -> BoxFuture<'_, Result<()>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            if let Some(path) = self.find_file(&id) {
+                std::fs::remove_file(&path)
+                    .map_err(|e| BrainError::Vault(format!("failed to delete file: {e}")))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn list_all(&self) -> BoxFuture<'_, Result<Vec<Memory>>> {
+        Box::pin(async move {
+            let mut memories = Vec::new();
+
+            let entries = std::fs::read_dir(&self.vault_path)
+                .map_err(|e| BrainError::Vault(format!("failed to read vault directory: {e}")))?;
+
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let dir_name = entry.file_name();
+                let dir_name = dir_name.to_string_lossy();
+                if dir_name.starts_with('.') || dir_name.starts_with('_') {
+                    continue;
+                }
+
+                let sub_entries = match std::fs::read_dir(&path) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+
+                for sub_entry in sub_entries.flatten() {
+                    let file_path = sub_entry.path();
+                    if file_path.extension().is_some_and(|ext| ext == "md") {
+                        match std::fs::read_to_string(&file_path) {
+                            Ok(text) => match parse_markdown(&text) {
+                                Ok(memory) => memories.push(memory),
+                                Err(e) => {
+                                    warn!("skipping {}: {e}", file_path.display());
+                                }
+                            },
                             Err(e) => {
-                                warn!("skipping {}: {e}", file_path.display());
+                                warn!("failed to read {}: {e}", file_path.display());
                             }
-                        },
-                        Err(e) => {
-                            warn!("failed to read {}: {e}", file_path.display());
                         }
                     }
                 }
             }
-        }
 
-        Ok(memories)
+            Ok(memories)
+        })
     }
 }
 
