@@ -1,0 +1,17 @@
+[vault]
+path = "~/brain"
+templates_dir = "_templates"
+categories = ["procedures", "decisions", "learnings", "concepts", "projects"]
+
+[embedding]
+provider = "openai"
+model = "text-embedding-3-small"
+api_key_env = "OPENAI_API_KEY"
+
+[index]
+backend = "sqlite-vec"
+path = "~/.config/brain-mcp/index.db"
+
+[server]
+http_port = 47200
+grace_period_seconds = 60
