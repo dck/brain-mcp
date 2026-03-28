@@ -1,3 +1,49 @@
-fn main() {
-    println!("brain-mcp");
+mod commands;
+mod output;
+
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(
+    name = "brain-mcp",
+    version,
+    about = "Persistent memory for AI coding agents"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+
+    /// Path to config file
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
+    /// Output as JSON
+    #[arg(long, global = true)]
+    json: bool,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start the memory server
+    Serve {
+        /// Run in background
+        #[arg(long)]
+        daemonize: bool,
+    },
+    /// Show server status
+    Status,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Serve { daemonize } => commands::serve::run(cli.config, daemonize).await,
+        Commands::Status => commands::status::run(cli.json).await,
+    }
 }

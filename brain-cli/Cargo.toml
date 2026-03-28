@@ -23,5 +23,9 @@ indicatif = "0.17"
 console = "0.15"
 dialoguer = "0.11"
 toml = "0.8"
+dirs = "6"
+libc = "0.2"
+chrono = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
