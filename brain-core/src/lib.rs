@@ -1,1 +1,2 @@
-// brain-core: domain types and traits
+pub mod error;
+pub mod model;
