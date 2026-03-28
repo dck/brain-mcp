@@ -11,3 +11,6 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 slug = "0.1"
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
