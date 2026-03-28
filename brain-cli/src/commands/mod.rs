@@ -1,6 +1,8 @@
 pub mod init;
+pub mod reindex;
 pub mod serve;
 pub mod status;
+pub mod stop;
 
 use std::path::PathBuf;
 

@@ -35,6 +35,10 @@ enum Commands {
     },
     /// Show server status
     Status,
+    /// Stop the running server
+    Stop,
+    /// Full reindex of the vault
+    Reindex,
 }
 
 #[tokio::main]
@@ -48,5 +52,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init => commands::init::run(cli.json).await,
         Commands::Serve { daemonize } => commands::serve::run(cli.config, daemonize).await,
         Commands::Status => commands::status::run(cli.json).await,
+        Commands::Stop => commands::stop::run().await,
+        Commands::Reindex => commands::reindex::run(cli.config, cli.json).await,
     }
 }
