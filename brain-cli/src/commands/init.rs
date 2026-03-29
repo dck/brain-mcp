@@ -130,14 +130,19 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
         .collect();
 
     // 3. Embedding provider
-    let providers = &[
-        "OpenAI",
-        "Voyage (not yet supported)",
-        "Local ONNX (not yet supported)",
-    ];
+    let mut providers = vec!["OpenAI".to_string()];
+
+    #[cfg(feature = "local-embeddings")]
+    providers.push("Local ONNX (all-MiniLM-L6-v2, ~90MB download)".to_string());
+
+    #[cfg(not(feature = "local-embeddings"))]
+    providers
+        .push("Local ONNX (not available — rebuild with --features local-embeddings)".to_string());
+
+    let provider_refs: Vec<&str> = providers.iter().map(|s| s.as_str()).collect();
     let provider_idx = Select::new()
         .with_prompt("  Embedding provider")
-        .items(providers)
+        .items(&provider_refs)
         .default(0)
         .interact()?;
 
@@ -153,10 +158,48 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
                 .interact_text()?;
             ("openai".to_string(), model, Some(env_var), None)
         }
-        _ => {
-            eprintln!("  Only OpenAI is supported at this time.");
+        #[cfg(feature = "local-embeddings")]
+        1 => {
+            let model_dir = config_dir().join("models/all-MiniLM-L6-v2");
+            std::fs::create_dir_all(&model_dir)?;
+
+            let model_path = model_dir.join("model.onnx");
+            let tokenizer_path = model_dir.join("tokenizer.json");
+
+            if !model_path.exists() {
+                download_file(
+                    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx",
+                    &model_path,
+                    "Downloading model.onnx",
+                ).await?;
+            } else {
+                println!("{}", output::success("model.onnx already downloaded"));
+            }
+
+            if !tokenizer_path.exists() {
+                download_file(
+                    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json",
+                    &tokenizer_path,
+                    "Downloading tokenizer.json",
+                ).await?;
+            } else {
+                println!("{}", output::success("tokenizer.json already downloaded"));
+            }
+
+            (
+                "onnx".to_string(),
+                "all-MiniLM-L6-v2".to_string(),
+                None,
+                Some(model_dir.to_string_lossy().to_string()),
+            )
+        }
+        #[cfg(not(feature = "local-embeddings"))]
+        1 => {
+            eprintln!("  ONNX support not compiled in. Rebuild with:");
+            eprintln!("    cargo install --path brain-cli --features local-embeddings");
             std::process::exit(1);
         }
+        _ => unreachable!(),
     };
 
     // 4. HTTP port
@@ -249,12 +292,51 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
 
     println!();
     println!("  {}", console::style("Next steps:").bold());
-    println!(
-        "    1. Set your {} env var",
-        console::style("OPENAI_API_KEY").bold()
-    );
-    println!("    2. Run {}", console::style("brain-mcp serve").bold());
+    if resolved.embedding.provider == "openai" {
+        println!(
+            "    1. Set your {} env var",
+            console::style("OPENAI_API_KEY").bold()
+        );
+        println!("    2. Run {}", console::style("brain-mcp serve").bold());
+    } else {
+        println!("    Run {}", console::style("brain-mcp serve").bold());
+    }
     println!();
 
+    Ok(())
+}
+
+#[cfg(feature = "local-embeddings")]
+async fn download_file(url: &str, dest: &std::path::Path, label: &str) -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+    use indicatif::{ProgressBar, ProgressStyle};
+    use tokio::io::AsyncWriteExt;
+
+    let client = reqwest::Client::new();
+    let resp = client.get(url).send().await?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("Download failed: HTTP {}", resp.status());
+    }
+
+    let total_size = resp.content_length().unwrap_or(0);
+    let pb = ProgressBar::new(total_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("  {msg} [{bar:30}] {bytes}/{total_bytes} ({eta})")
+            .unwrap()
+            .progress_chars("=> "),
+    );
+    pb.set_message(label.to_string());
+
+    let mut file = tokio::fs::File::create(dest).await?;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+        pb.inc(chunk.len() as u64);
+    }
+    file.flush().await?;
+    pb.finish_with_message(format!("{label} done"));
     Ok(())
 }
