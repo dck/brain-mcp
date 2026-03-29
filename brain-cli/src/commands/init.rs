@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 
 use brain_core::config::{Config, EmbeddingConfig, IndexConfig, ServerConfig, VaultConfig};
@@ -112,14 +113,16 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
     println!();
 
     // 1. Vault path
-    let vault_path: String = Input::new()
+    let theme = ColorfulTheme::default();
+
+    let vault_path: String = Input::with_theme(&theme)
         .with_prompt("  Vault path")
         .default("~/brain".into())
         .interact_text()?;
 
     // 2. Categories
     let defaults = vec![true; ALL_CATEGORIES.len()];
-    let chosen = MultiSelect::new()
+    let chosen = MultiSelect::with_theme(&theme)
         .with_prompt("  Categories (space to toggle)")
         .items(ALL_CATEGORIES)
         .defaults(&defaults)
@@ -140,7 +143,7 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
         .push("Local ONNX (not available — rebuild with --features local-embeddings)".to_string());
 
     let provider_refs: Vec<&str> = providers.iter().map(|s| s.as_str()).collect();
-    let provider_idx = Select::new()
+    let provider_idx = Select::with_theme(&theme)
         .with_prompt("  Embedding provider")
         .items(&provider_refs)
         .default(0)
@@ -148,11 +151,11 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
 
     let (provider, model, api_key_env, model_path) = match provider_idx {
         0 => {
-            let model: String = Input::new()
+            let model: String = Input::with_theme(&theme)
                 .with_prompt("  OpenAI model")
                 .default("text-embedding-3-small".into())
                 .interact_text()?;
-            let env_var: String = Input::new()
+            let env_var: String = Input::with_theme(&theme)
                 .with_prompt("  API key env var")
                 .default("OPENAI_API_KEY".into())
                 .interact_text()?;
@@ -203,13 +206,13 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
     };
 
     // 4. HTTP port
-    let http_port: u16 = Input::new()
+    let http_port: u16 = Input::with_theme(&theme)
         .with_prompt("  HTTP port")
         .default(47200)
         .interact_text()?;
 
     // 5. Grace period
-    let grace_period: u64 = Input::new()
+    let grace_period: u64 = Input::with_theme(&theme)
         .with_prompt("  Grace period (seconds)")
         .default(60)
         .interact_text()?;
@@ -242,7 +245,7 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config_dir)?;
     let config_path = default_config_path();
     if config_path.exists() {
-        let overwrite = Confirm::new()
+        let overwrite = Confirm::with_theme(&theme)
             .with_prompt("  Config already exists. Overwrite?")
             .default(false)
             .interact()?;
