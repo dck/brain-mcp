@@ -7,6 +7,9 @@ edition.workspace = true
 name = "brain-mcp"
 path = "src/main.rs"
 
+[features]
+local-embeddings = ["brain-embed/local-embeddings"]
+
 [dependencies]
 brain-core = { workspace = true }
 brain-vault = { workspace = true }

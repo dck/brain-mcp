@@ -1,5 +1,9 @@
+#[cfg(feature = "local-embeddings")]
+mod onnx;
 mod openai;
 
+#[cfg(feature = "local-embeddings")]
+pub use onnx::OnnxEmbedder;
 pub use openai::OpenAiEmbedder;
 
 use std::sync::Arc;
@@ -27,6 +31,22 @@ pub fn create_embedder(config: &EmbeddingConfig) -> Result<Arc<dyn EmbeddingPort
                 config.model.clone(),
                 dims,
             )))
+        }
+        #[cfg(feature = "local-embeddings")]
+        "onnx" => {
+            let model_path = config
+                .model_path
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("model_path required for ONNX provider"))?;
+            let embedder =
+                onnx::OnnxEmbedder::new(std::path::Path::new(model_path), config.model.clone())?;
+            Ok(Arc::new(embedder))
+        }
+        #[cfg(not(feature = "local-embeddings"))]
+        "onnx" => {
+            anyhow::bail!(
+                "ONNX support not compiled in. Rebuild with: cargo install --path brain-cli --features local-embeddings"
+            )
         }
         other => anyhow::bail!("unknown embedding provider: {other}"),
     }
