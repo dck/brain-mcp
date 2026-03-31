@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 
 use brain_core::error::BrainError;
@@ -196,18 +195,30 @@ async fn wait_for_server(state_dir: &Path, timeout: Duration) -> anyhow::Result<
 
 async fn run_stdio_bridge(http_url: &str) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
-    let stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let reader = BufReader::new(stdin);
-    let mut lines = reader.lines();
+    let url = http_url.to_string();
 
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
+    // Read stdin in a blocking thread — tokio's async stdin can miss
+    // pipe input from parent processes like Claude Code.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(line) if !line.trim().is_empty() => {
+                    if tx.blocking_send(line).is_err() {
+                        break;
+                    }
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
         }
+    });
 
+    while let Some(line) = rx.recv().await {
         let response = client
-            .post(http_url)
+            .post(&url)
             .header("Content-Type", "application/json")
             .body(line)
             .send()
@@ -215,10 +226,12 @@ async fn run_stdio_bridge(http_url: &str) -> anyhow::Result<()> {
 
         match response {
             Ok(resp) => {
+                use std::io::Write;
                 let body = resp.bytes().await?;
-                stdout.write_all(&body).await?;
-                stdout.write_all(b"\n").await?;
-                stdout.flush().await?;
+                let mut stdout = std::io::stdout().lock();
+                stdout.write_all(&body)?;
+                stdout.write_all(b"\n")?;
+                stdout.flush()?;
             }
             Err(e) => {
                 eprintln!("HTTP request failed: {e}");
