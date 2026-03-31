@@ -25,6 +25,7 @@ clap = { version = "4", features = ["derive"] }
 indicatif = "0.18"
 console = "0.16"
 dialoguer = "0.12"
+rustyline = "15"
 toml = "1"
 dirs = "6"
 libc = "0.2"
