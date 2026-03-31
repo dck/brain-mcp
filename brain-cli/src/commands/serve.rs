@@ -146,13 +146,24 @@ async fn read_existing_state(state_dir: &Path) -> Option<ServerState> {
 }
 
 fn spawn_server() -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+
     let exe = std::env::current_exe()?;
-    std::process::Command::new(exe)
-        .arg("serve")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+    unsafe {
+        std::process::Command::new(exe)
+            .arg("serve")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .pre_exec(|| {
+                // Create a new session so the server is fully detached.
+                // Without this, killing the parent process group (e.g.
+                // when Claude Code exits) would also kill the server.
+                libc::setsid();
+                Ok(())
+            })
+            .spawn()?;
+    }
     Ok(())
 }
 
