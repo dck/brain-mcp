@@ -32,6 +32,9 @@ enum Commands {
         /// Run in background
         #[arg(long)]
         daemonize: bool,
+        /// Run as stdio bridge (for MCP command transport)
+        #[arg(long)]
+        stdio: bool,
     },
     /// Show server status
     Status,
@@ -50,7 +53,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Init => commands::init::run(cli.json).await,
-        Commands::Serve { daemonize } => commands::serve::run(cli.config, daemonize).await,
+        Commands::Serve { daemonize, stdio } => {
+            commands::serve::run(cli.config, daemonize, stdio).await
+        }
         Commands::Status => commands::status::run(cli.json).await,
         Commands::Stop => commands::stop::run().await,
         Commands::Reindex => commands::reindex::run(cli.config, cli.json).await,

@@ -214,11 +214,13 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
     };
 
     // 4. HTTP port
-    let http_port: u16 = prompt_input(&mut rl, "HTTP port", "47200")?.parse()
+    let http_port: u16 = prompt_input(&mut rl, "HTTP port", "47200")?
+        .parse()
         .map_err(|_| anyhow::anyhow!("Invalid port number"))?;
 
     // 5. Grace period
-    let grace_period: u64 = prompt_input(&mut rl, "Grace period (seconds)", "60")?.parse()
+    let grace_period: u64 = prompt_input(&mut rl, "Grace period (seconds)", "60")?
+        .parse()
         .map_err(|_| anyhow::anyhow!("Invalid number"))?;
 
     // Build config

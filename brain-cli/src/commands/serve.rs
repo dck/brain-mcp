@@ -1,7 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 
 use brain_core::error::BrainError;
@@ -16,7 +18,15 @@ use brain_vault::VaultAdapter;
 use super::{load_config, state_dir};
 use crate::output;
 
-pub async fn run(config_path: Option<PathBuf>, _daemonize: bool) -> anyhow::Result<()> {
+pub async fn run(
+    config_path: Option<PathBuf>,
+    _daemonize: bool,
+    stdio: bool,
+) -> anyhow::Result<()> {
+    if stdio {
+        return run_stdio(config_path).await;
+    }
+
     // 1. Load config
     let config = load_config(config_path)?;
 
@@ -95,5 +105,111 @@ pub async fn run(config_path: Option<PathBuf>, _daemonize: bool) -> anyhow::Resu
     // Singleton dropped here, releasing lock + removing state file
     drop(singleton);
     println!("{}", output::success("Server stopped"));
+    Ok(())
+}
+
+// --- stdio bridge mode ---
+
+async fn run_stdio(_config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let state_dir = state_dir();
+
+    // Check if server is already running, spawn if not
+    let state = match read_existing_state(&state_dir).await {
+        Some(state) => state,
+        None => {
+            eprintln!("Starting brain-mcp server...");
+            spawn_server()?;
+            wait_for_server(&state_dir, Duration::from_secs(30)).await?
+        }
+    };
+
+    eprintln!("Connected to server at {}", state.http);
+    run_stdio_bridge(&state.http).await
+}
+
+/// Read state and verify the HTTP endpoint is actually responding.
+async fn read_existing_state(state_dir: &Path) -> Option<ServerState> {
+    let state = Singleton::read_state(state_dir)?;
+    let client = reqwest::Client::new();
+    let ok = client
+        .post(&state.http)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "id": 0,
+            "params": {}
+        }))
+        .send()
+        .await
+        .is_ok();
+    if ok { Some(state) } else { None }
+}
+
+fn spawn_server() -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe)
+        .arg("serve")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+async fn wait_for_server(state_dir: &Path, timeout: Duration) -> anyhow::Result<ServerState> {
+    let start = Instant::now();
+    loop {
+        if let Some(state) = Singleton::read_state(state_dir) {
+            let client = reqwest::Client::new();
+            if client
+                .post(&state.http)
+                .json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "initialize",
+                    "id": 0,
+                    "params": {}
+                }))
+                .send()
+                .await
+                .is_ok()
+            {
+                return Ok(state);
+            }
+        }
+        if start.elapsed() > timeout {
+            anyhow::bail!("Timeout waiting for server to start");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn run_stdio_bridge(http_url: &str) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    let stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let reader = BufReader::new(stdin);
+    let mut lines = reader.lines();
+
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let response = client.post(http_url).body(line).send().await;
+
+        match response {
+            Ok(resp) => {
+                let body = resp.bytes().await?;
+                stdout.write_all(&body).await?;
+                stdout.write_all(b"\n").await?;
+                stdout.flush().await?;
+            }
+            Err(e) => {
+                eprintln!("HTTP request failed: {e}");
+                anyhow::bail!("Server unreachable");
+            }
+        }
+    }
+
     Ok(())
 }
