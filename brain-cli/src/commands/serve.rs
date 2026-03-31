@@ -206,7 +206,12 @@ async fn run_stdio_bridge(http_url: &str) -> anyhow::Result<()> {
             continue;
         }
 
-        let response = client.post(http_url).body(line).send().await;
+        let response = client
+            .post(http_url)
+            .header("Content-Type", "application/json")
+            .body(line)
+            .send()
+            .await;
 
         match response {
             Ok(resp) => {
