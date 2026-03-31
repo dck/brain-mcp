@@ -1,12 +1,35 @@
+use std::io::Write;
 use std::path::PathBuf;
 
 use dialoguer::theme::ColorfulTheme;
-use dialoguer::{Confirm, Input, MultiSelect, Select};
+use dialoguer::{Confirm, MultiSelect, Select};
 
 use brain_core::config::{Config, EmbeddingConfig, IndexConfig, ServerConfig, VaultConfig};
 
 use super::{config_dir, default_config_path};
 use crate::output;
+
+fn prompt_input(label: &str, default: &str) -> anyhow::Result<String> {
+    let term = console::Term::stdout();
+    if default.is_empty() {
+        term.write_str(&format!("  {}: ", console::style(label).bold()))?;
+    } else {
+        term.write_str(&format!(
+            "  {} [{}]: ",
+            console::style(label).bold(),
+            console::style(default).dim()
+        ))?;
+    }
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim().to_string();
+    if input.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(input)
+    }
+}
 
 const ALL_CATEGORIES: &[&str] = &[
     "procedures",
@@ -115,10 +138,7 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
     // 1. Vault path
     let theme = ColorfulTheme::default();
 
-    let vault_path: String = Input::with_theme(&theme)
-        .with_prompt("  Vault path")
-        .default("~/brain".into())
-        .interact_text()?;
+    let vault_path = prompt_input("Vault path", "~/brain")?;
 
     // 2. Categories
     let defaults = vec![true; ALL_CATEGORIES.len()];
@@ -151,14 +171,8 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
 
     let (provider, model, api_key_env, model_path) = match provider_idx {
         0 => {
-            let model: String = Input::with_theme(&theme)
-                .with_prompt("  OpenAI model")
-                .default("text-embedding-3-small".into())
-                .interact_text()?;
-            let env_var: String = Input::with_theme(&theme)
-                .with_prompt("  API key env var")
-                .default("OPENAI_API_KEY".into())
-                .interact_text()?;
+            let model = prompt_input("OpenAI model", "text-embedding-3-small")?;
+            let env_var = prompt_input("API key env var", "OPENAI_API_KEY")?;
             ("openai".to_string(), model, Some(env_var), None)
         }
         #[cfg(feature = "local-embeddings")]
@@ -206,16 +220,12 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
     };
 
     // 4. HTTP port
-    let http_port: u16 = Input::with_theme(&theme)
-        .with_prompt("  HTTP port")
-        .default(47200)
-        .interact_text()?;
+    let http_port: u16 = prompt_input("HTTP port", "47200")?.parse()
+        .map_err(|_| anyhow::anyhow!("Invalid port number"))?;
 
     // 5. Grace period
-    let grace_period: u64 = Input::with_theme(&theme)
-        .with_prompt("  Grace period (seconds)")
-        .default(60)
-        .interact_text()?;
+    let grace_period: u64 = prompt_input("Grace period (seconds)", "60")?.parse()
+        .map_err(|_| anyhow::anyhow!("Invalid number"))?;
 
     // Build config
     let config = Config {
