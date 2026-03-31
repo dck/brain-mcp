@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use dialoguer::theme::ColorfulTheme;
-use dialoguer::{Confirm, MultiSelect, Select};
+use dialoguer::{MultiSelect, Select};
 use rustyline::DefaultEditor;
 
 use brain_core::config::{Config, EmbeddingConfig, IndexConfig, ServerConfig, VaultConfig};
@@ -116,30 +116,58 @@ category: {{category}}
 
 pub async fn run(json_output: bool) -> anyhow::Result<()> {
     if json_output {
-        // Non-interactive mode is not supported with --json; just error.
         anyhow::bail!("init requires interactive input and cannot be used with --json");
     }
+
+    // Load existing config as defaults (if any)
+    let existing = load_existing_config();
+    let is_reconfigure = existing.is_some();
 
     println!();
     println!(
         "  {} {}",
         console::style("brain-mcp").bold(),
-        console::style("setup wizard").dim()
+        if is_reconfigure {
+            console::style("reconfigure (existing values shown as defaults)").dim()
+        } else {
+            console::style("setup wizard").dim()
+        }
     );
     println!();
 
     let mut rl = DefaultEditor::new()?;
     let theme = ColorfulTheme::default();
 
+    // Defaults from existing config or sensible fallbacks
+    let def_vault = existing.as_ref().map_or("~/brain", |c| c.vault.path.as_str());
+    let def_model = existing.as_ref().map_or("text-embedding-3-small", |c| c.embedding.model.as_str());
+    let def_api_key_env = existing.as_ref()
+        .and_then(|c| c.embedding.api_key_env.as_deref())
+        .unwrap_or("OPENAI_API_KEY");
+    let def_port = existing.as_ref().map_or(47200, |c| c.server.http_port);
+    let def_grace = existing.as_ref().map_or(60, |c| c.server.grace_period_seconds);
+    let def_provider = existing.as_ref().map_or("openai", |c| c.embedding.provider.as_str());
+
     // 1. Vault path
-    let vault_path = prompt_input(&mut rl, "Vault path", "~/brain")?;
+    let vault_path = prompt_input(&mut rl, "Vault path", def_vault)?;
 
     // 2. Categories
-    let defaults = vec![true; ALL_CATEGORIES.len()];
+    let existing_cats: Vec<String> = existing.as_ref()
+        .map(|c| c.vault.categories.clone())
+        .unwrap_or_default();
+    let cat_defaults: Vec<bool> = ALL_CATEGORIES.iter()
+        .map(|cat| {
+            if existing_cats.is_empty() {
+                true // first run: all on
+            } else {
+                existing_cats.iter().any(|c| c == cat)
+            }
+        })
+        .collect();
     let chosen = MultiSelect::with_theme(&theme)
         .with_prompt("  Categories (space to toggle)")
         .items(ALL_CATEGORIES)
-        .defaults(&defaults)
+        .defaults(&cat_defaults)
         .interact()?;
     let categories: Vec<String> = chosen
         .iter()
@@ -156,17 +184,21 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
     providers
         .push("Local ONNX (not available — rebuild with --features local-embeddings)".to_string());
 
+    let default_provider_idx = match def_provider {
+        "onnx" => 1,
+        _ => 0,
+    };
     let provider_refs: Vec<&str> = providers.iter().map(|s| s.as_str()).collect();
     let provider_idx = Select::with_theme(&theme)
         .with_prompt("  Embedding provider")
         .items(&provider_refs)
-        .default(0)
+        .default(default_provider_idx)
         .interact()?;
 
     let (provider, model, api_key_env, model_path) = match provider_idx {
         0 => {
-            let model = prompt_input(&mut rl, "OpenAI model", "text-embedding-3-small")?;
-            let env_var = prompt_input(&mut rl, "API key env var", "OPENAI_API_KEY")?;
+            let model = prompt_input(&mut rl, "OpenAI model", def_model)?;
+            let env_var = prompt_input(&mut rl, "API key env var", def_api_key_env)?;
             ("openai".to_string(), model, Some(env_var), None)
         }
         #[cfg(feature = "local-embeddings")]
@@ -214,12 +246,12 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
     };
 
     // 4. HTTP port
-    let http_port: u16 = prompt_input(&mut rl, "HTTP port", "47200")?
+    let http_port: u16 = prompt_input(&mut rl, "HTTP port", &def_port.to_string())?
         .parse()
         .map_err(|_| anyhow::anyhow!("Invalid port number"))?;
 
     // 5. Grace period
-    let grace_period: u64 = prompt_input(&mut rl, "Grace period (seconds)", "60")?
+    let grace_period: u64 = prompt_input(&mut rl, "Grace period (seconds)", &def_grace.to_string())?
         .parse()
         .map_err(|_| anyhow::anyhow!("Invalid number"))?;
 
@@ -246,20 +278,10 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
         },
     };
 
-    // Write config
+    // Write config (always write — user chose to run init)
     let config_dir = config_dir();
     std::fs::create_dir_all(&config_dir)?;
     let config_path = default_config_path();
-    if config_path.exists() {
-        let overwrite = Confirm::with_theme(&theme)
-            .with_prompt("  Config already exists. Overwrite?")
-            .default(false)
-            .interact()?;
-        if !overwrite {
-            println!("{}", output::info_line("Skipped", "config file unchanged"));
-            return Ok(());
-        }
-    }
     let toml_str = toml::to_string_pretty(&config)?;
     std::fs::write(&config_path, &toml_str)?;
     println!(
@@ -313,6 +335,12 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
     println!();
 
     Ok(())
+}
+
+fn load_existing_config() -> Option<Config> {
+    let path = default_config_path();
+    let raw = std::fs::read_to_string(&path).ok()?;
+    toml::from_str(&raw).ok()
 }
 
 #[cfg(feature = "local-embeddings")]
