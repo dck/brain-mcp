@@ -139,34 +139,23 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
     let theme = ColorfulTheme::default();
 
     // Defaults from existing config or sensible fallbacks
-    let def_vault = existing
-        .as_ref()
-        .map_or("~/brain", |c| c.vault.path.as_str());
-    let def_model = existing
-        .as_ref()
-        .map_or("text-embedding-3-small", |c| c.embedding.model.as_str());
-    let def_api_key_env = existing
-        .as_ref()
+    let def_vault = existing.as_ref().map_or("~/brain", |c| c.vault.path.as_str());
+    let def_model = existing.as_ref().map_or("text-embedding-3-small", |c| c.embedding.model.as_str());
+    let def_api_key_env = existing.as_ref()
         .and_then(|c| c.embedding.api_key_env.as_deref())
         .unwrap_or("OPENAI_API_KEY");
     let def_port = existing.as_ref().map_or(47200, |c| c.server.http_port);
-    let def_grace = existing
-        .as_ref()
-        .map_or(60, |c| c.server.grace_period_seconds);
-    let def_provider = existing
-        .as_ref()
-        .map_or("openai", |c| c.embedding.provider.as_str());
+    let def_grace = existing.as_ref().map_or(60, |c| c.server.grace_period_seconds);
+    let def_provider = existing.as_ref().map_or("openai", |c| c.embedding.provider.as_str());
 
     // 1. Vault path
     let vault_path = prompt_input(&mut rl, "Vault path", def_vault)?;
 
     // 2. Categories
-    let existing_cats: Vec<String> = existing
-        .as_ref()
+    let existing_cats: Vec<String> = existing.as_ref()
         .map(|c| c.vault.categories.clone())
         .unwrap_or_default();
-    let cat_defaults: Vec<bool> = ALL_CATEGORIES
-        .iter()
+    let cat_defaults: Vec<bool> = ALL_CATEGORIES.iter()
         .map(|cat| {
             if existing_cats.is_empty() {
                 true // first run: all on
@@ -262,10 +251,9 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("Invalid port number"))?;
 
     // 5. Grace period
-    let grace_period: u64 =
-        prompt_input(&mut rl, "Grace period (seconds)", &def_grace.to_string())?
-            .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid number"))?;
+    let grace_period: u64 = prompt_input(&mut rl, "Grace period (seconds)", &def_grace.to_string())?
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid number"))?;
 
     // Build config
     let config = Config {

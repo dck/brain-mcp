@@ -16,15 +16,8 @@ pub struct OpenAiEmbedder {
 impl OpenAiEmbedder {
     pub fn new(base_url: String, api_key: String, model: String, dims: usize) -> Self {
         let model_id = format!("openai:{model}");
-        // Disable proxy for localhost (test servers like wiremock).
-        // System proxies intercept localhost requests and return 502.
-        let client = if base_url.contains("127.0.0.1") || base_url.contains("localhost") {
-            Client::builder().no_proxy().build().unwrap_or_default()
-        } else {
-            Client::new()
-        };
         Self {
-            client,
+            client: Client::new(),
             base_url,
             api_key,
             model,

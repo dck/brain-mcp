@@ -30,13 +30,10 @@ toml = "1"
 dirs = "6"
 libc = "0.2"
 chrono = { workspace = true }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream"] }
 futures-util = "0.3"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-http-body-util = "0.1"
-tower = { version = "0.5", features = ["util"] }
-axum = { version = "0.8", features = ["json"] }
