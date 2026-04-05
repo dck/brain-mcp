@@ -129,7 +129,7 @@ async fn run_stdio(_config_path: Option<PathBuf>) -> anyhow::Result<()> {
 /// Read state and verify the HTTP endpoint is actually responding.
 async fn read_existing_state(state_dir: &Path) -> Option<ServerState> {
     let state = Singleton::read_state(state_dir)?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build().ok()?;
     let ok = client
         .post(&state.http)
         .json(&serde_json::json!({
@@ -167,7 +167,7 @@ async fn wait_for_server(state_dir: &Path, timeout: Duration) -> anyhow::Result<
     let start = Instant::now();
     loop {
         if let Some(state) = Singleton::read_state(state_dir) {
-            let client = reqwest::Client::new();
+            let client = reqwest::Client::builder().no_proxy().build()?;
             if client
                 .post(&state.http)
                 .json(&serde_json::json!({
@@ -191,16 +191,19 @@ async fn wait_for_server(state_dir: &Path, timeout: Duration) -> anyhow::Result<
 }
 
 async fn run_stdio_bridge(http_url: &str) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
+    use std::io::BufRead;
+
+    let client = reqwest::Client::builder().no_proxy().build()?;
     let url = http_url.to_string();
 
-    // Read stdin in a blocking thread — tokio's async stdin can miss
-    // pipe input from parent processes like Claude Code.
+    // Read stdin in a blocking thread with persistent lock.
+    // The lock must be held for the entire read loop — dropping and
+    // re-acquiring it loses any data buffered by the previous lock.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
     std::thread::spawn(move || {
-        use std::io::BufRead;
         let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
+        let reader = stdin.lock();
+        for line in reader.lines() {
             match line {
                 Ok(line) if !line.trim().is_empty() => {
                     if tx.blocking_send(line).is_err() {
@@ -214,17 +217,17 @@ async fn run_stdio_bridge(http_url: &str) -> anyhow::Result<()> {
     });
 
     while let Some(line) = rx.recv().await {
-        let response = client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .body(line)
-            .send()
-            .await;
-
-        match response {
+        let json_value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Invalid JSON from stdin: {e}");
+                continue;
+            }
+        };
+        match client.post(&url).json(&json_value).send().await {
             Ok(resp) => {
-                use std::io::Write;
                 let body = resp.bytes().await?;
+                use std::io::Write;
                 let mut stdout = std::io::stdout().lock();
                 stdout.write_all(&body)?;
                 stdout.write_all(b"\n")?;

@@ -21,5 +21,6 @@ toml = "1"
 
 [dev-dependencies]
 tokio = { workspace = true }
-reqwest = { version = "0.13", features = ["json"] }
 tempfile = "3"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
