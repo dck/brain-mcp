@@ -39,7 +39,16 @@ impl McpHandler {
                 "serverInfo": {
                     "name": "brain-mcp",
                     "version": "0.1.0"
-                }
+                },
+                "instructions": "You have persistent cross-project memory via brain-mcp. \
+                    Search automatically: at the start of every session (search for the current project name and task keywords), \
+                    and when the user mentions something that might have prior context (deployment, setup, debugging a recurring issue). \
+                    Store only what's worth remembering: procedures that save time, hard-won debugging insights, \
+                    project conventions, environment-specific quirks. \
+                    Never store: work summaries, refactoring plans, implementation details, generic knowledge, \
+                    things already in code/README/CLAUDE.md. \
+                    Litmus test: would a future session need this AND is it not already in the codebase? \
+                    Write for your future self — include the why, not just the what. Use tags: project name + topic keywords."
             }),
         )
     }
