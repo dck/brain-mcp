@@ -4,7 +4,7 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "memory_store",
-            "description": "Store a persistent memory that survives across sessions and projects. Use this to save: architectural decisions and their rationale, deployment procedures and runbooks, debugging insights and root causes, project-specific context that future sessions will need, learned patterns and best practices. Write content as if explaining to a future version of yourself that has no context. Include the 'why', not just the 'what'. Use descriptive tags for discoverability.",
+            "description": "Store a memory only when it passes this test: (1) a future session would need this information, (2) it's not already in the codebase (code, README, CLAUDE.md), and (3) it took real effort to discover or decide. Good examples: deployment procedures, hard-won debugging insights, environment-specific setup steps, project conventions. Never store: summaries of completed work, refactoring plans, implementation details, generic knowledge. Write as if explaining to a future version of yourself with no context. Include the 'why', not just the 'what'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
