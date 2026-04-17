@@ -214,6 +214,8 @@ async fn run_stdio_bridge(http_url: &str) -> anyhow::Result<()> {
     });
 
     while let Some(line) = rx.recv().await {
+        let is_notification = is_jsonrpc_notification(&line);
+
         let response = client
             .post(&url)
             .header("Content-Type", "application/json")
@@ -223,12 +225,17 @@ async fn run_stdio_bridge(http_url: &str) -> anyhow::Result<()> {
 
         match response {
             Ok(resp) => {
-                use std::io::Write;
                 let body = resp.bytes().await?;
-                let mut stdout = std::io::stdout().lock();
-                stdout.write_all(&body)?;
-                stdout.write_all(b"\n")?;
-                stdout.flush()?;
+                // Per JSON-RPC 2.0, notifications must not receive a response.
+                // The HTTP server always returns one; swallow it here so clients
+                // like Claude Code don't see a malformed frame (result without id).
+                if !is_notification {
+                    use std::io::Write;
+                    let mut stdout = std::io::stdout().lock();
+                    stdout.write_all(&body)?;
+                    stdout.write_all(b"\n")?;
+                    stdout.flush()?;
+                }
             }
             Err(e) => {
                 eprintln!("HTTP request failed: {e}");
@@ -238,4 +245,41 @@ async fn run_stdio_bridge(http_url: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// A JSON-RPC request is a notification when it carries no `id` field.
+fn is_jsonrpc_notification(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.as_object().map(|o| !o.contains_key("id")))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_jsonrpc_notification;
+
+    #[test]
+    fn notification_without_id() {
+        let line = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        assert!(is_jsonrpc_notification(line));
+    }
+
+    #[test]
+    fn request_with_id_is_not_notification() {
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        assert!(!is_jsonrpc_notification(line));
+    }
+
+    #[test]
+    fn request_with_null_id_is_not_notification() {
+        // A null id is still an id field — treat as a request, not a notification.
+        let line = r#"{"jsonrpc":"2.0","id":null,"method":"foo"}"#;
+        assert!(!is_jsonrpc_notification(line));
+    }
+
+    #[test]
+    fn malformed_json_is_not_notification() {
+        assert!(!is_jsonrpc_notification("not json"));
+    }
 }
