@@ -126,10 +126,20 @@ async fn run_stdio(_config_path: Option<PathBuf>) -> anyhow::Result<()> {
     run_stdio_bridge(&state.http).await
 }
 
+/// Build a reqwest client that bypasses any system HTTP proxy. The bridge,
+/// health checks, and reindex all talk to a loopback address; a misconfigured
+/// system proxy (e.g. Clash on macOS) otherwise swallows those requests.
+fn loopback_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("reqwest client without proxy never fails to build")
+}
+
 /// Read state and verify the HTTP endpoint is actually responding.
 async fn read_existing_state(state_dir: &Path) -> Option<ServerState> {
     let state = Singleton::read_state(state_dir)?;
-    let client = reqwest::Client::new();
+    let client = loopback_client();
     let ok = client
         .post(&state.http)
         .json(&serde_json::json!({
@@ -167,7 +177,7 @@ async fn wait_for_server(state_dir: &Path, timeout: Duration) -> anyhow::Result<
     let start = Instant::now();
     loop {
         if let Some(state) = Singleton::read_state(state_dir) {
-            let client = reqwest::Client::new();
+            let client = loopback_client();
             if client
                 .post(&state.http)
                 .json(&serde_json::json!({
@@ -191,7 +201,7 @@ async fn wait_for_server(state_dir: &Path, timeout: Duration) -> anyhow::Result<
 }
 
 async fn run_stdio_bridge(http_url: &str) -> anyhow::Result<()> {
-    let client = reqwest::Client::new();
+    let client = loopback_client();
     let url = http_url.to_string();
 
     // Read stdin in a blocking thread — tokio's async stdin can miss

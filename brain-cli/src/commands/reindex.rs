@@ -35,7 +35,10 @@ async fn reindex_via_server(base_url: &str, json_output: bool) -> anyhow::Result
         None
     };
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("reqwest client without proxy never fails to build");
     let resp: serde_json::Value = client
         .post(base_url)
         .json(&json!({
