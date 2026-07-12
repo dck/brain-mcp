@@ -5,6 +5,13 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "memory_store",
             "description": "Store a memory only when it passes this test: (1) a future session would need this information, (2) it's not already in the codebase (code, README, CLAUDE.md), and (3) it took real effort to discover or decide. Good examples: deployment procedures, hard-won debugging insights, environment-specific setup steps, project conventions. Never store: summaries of completed work, refactoring plans, implementation details, generic knowledge. Write as if explaining to a future version of yourself with no context. Include the 'why', not just the 'what'.",
+            "annotations": {
+                "title": "Store memory",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": false
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -30,7 +37,12 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "memory_search",
-            "description": "Search persistent memories by semantic similarity. Use this at the start of a task to find relevant past context — previous decisions, known procedures, debugging lessons, or project-specific insights. Also use when the user references something that might have been stored previously, or when you need context about a topic, project, or technology the user has worked with before.",
+            "description": "Search persistent memories by semantic similarity. Call this BEFORE acting: at the start of every session and every new task (search the project name + task keywords), when the user says 'always', 'never', 'as usual', or 'we decided', when you hit a recurring error or an unfamiliar convention, and before proposing an approach the user may have already ruled out. This call is cheap and read-only — when in doubt, search. Returns an explicit 'no relevant memories' message when nothing matches, so a speculative search costs almost nothing.",
+            "annotations": {
+                "title": "Search memories",
+                "readOnlyHint": true,
+                "openWorldHint": false
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -52,6 +64,11 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "memory_list",
             "description": "Browse stored memories by filter criteria without semantic search. Use this to see what memories exist for a project, category, or tag — for example, listing all procedures, or all memories tagged with a specific technology.",
+            "annotations": {
+                "title": "List memories",
+                "readOnlyHint": true,
+                "openWorldHint": false
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -73,6 +90,13 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "memory_update",
             "description": "Update an existing memory. Use this to correct information, add new context to an existing memory, or update tags. Only the fields you provide will be changed; omitted fields keep their current values.",
+            "annotations": {
+                "title": "Update memory",
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -91,6 +115,13 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "memory_delete",
             "description": "Permanently delete a memory. Use when a memory is outdated, incorrect, or no longer relevant.",
+            "annotations": {
+                "title": "Delete memory",
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -102,6 +133,13 @@ pub fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "memory_reindex",
             "description": "Rebuild the entire search index from vault files. Use this after manually editing memory files in the vault, or if search results seem stale or incorrect. This is a heavy operation that re-embeds all memories.",
+            "annotations": {
+                "title": "Reindex memories",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {},

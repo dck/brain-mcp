@@ -32,7 +32,7 @@ impl McpHandler {
         Response::success(
             request.id.clone(),
             json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-06-18",
                 "capabilities": {
                     "tools": {}
                 },
@@ -41,9 +41,13 @@ impl McpHandler {
                     "version": "0.1.0"
                 },
                 "instructions": "You have persistent cross-project memory via brain-mcp. \
-                    Search automatically: at the start of every session (search for the current project name and task keywords), \
-                    and when the user mentions something that might have prior context (deployment, setup, debugging a recurring issue). \
-                    Store only what's worth remembering: procedures that save time, hard-won debugging insights, \
+                    RECALL FIRST: call memory_search at the start of every session and every new task \
+                    (search the project name + task keywords) BEFORE acting. \
+                    Also search when the user says 'always', 'never', 'as usual', or 'we decided', \
+                    when something might have prior context (deployment, setup, a recurring issue), \
+                    and before proposing an approach the user may have already ruled out. \
+                    Searching is cheap and read-only — when in doubt, search. \
+                    Store sparingly: procedures that save time, hard-won debugging insights, \
                     project conventions, environment-specific quirks. \
                     Never store: work summaries, refactoring plans, implementation details, generic knowledge, \
                     things already in code/README/CLAUDE.md. \
@@ -277,7 +281,7 @@ mod tests {
         let resp = handler.handle(req).await;
 
         let result = resp.result.unwrap();
-        assert_eq!(result["protocolVersion"], "2024-11-05");
+        assert_eq!(result["protocolVersion"], "2025-06-18");
         assert!(result["capabilities"]["tools"].is_object());
         assert_eq!(result["serverInfo"]["name"], "brain-mcp");
     }
@@ -299,6 +303,11 @@ mod tests {
         assert!(names.contains(&"memory_update"));
         assert!(names.contains(&"memory_delete"));
         assert!(names.contains(&"memory_reindex"));
+
+        let search = tools.iter().find(|t| t["name"] == "memory_search").unwrap();
+        assert_eq!(search["annotations"]["readOnlyHint"], true);
+        let delete = tools.iter().find(|t| t["name"] == "memory_delete").unwrap();
+        assert_eq!(delete["annotations"]["destructiveHint"], true);
     }
 
     #[tokio::test]

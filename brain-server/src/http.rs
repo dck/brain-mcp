@@ -108,7 +108,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(resp["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(resp["result"]["serverInfo"]["name"], "brain-mcp");
     }
 
