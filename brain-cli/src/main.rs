@@ -36,6 +36,15 @@ enum Commands {
         #[arg(long)]
         stdio: bool,
     },
+    /// Print a compact memory index for context injection (e.g. SessionStart hooks)
+    Recall {
+        /// Only include memories for this project (cross-project memories are always included)
+        #[arg(long)]
+        project: Option<String>,
+        /// Maximum number of memories to include
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
     /// Show server status
     Status,
     /// Stop the running server
@@ -55,6 +64,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init => commands::init::run(cli.json).await,
         Commands::Serve { daemonize, stdio } => {
             commands::serve::run(cli.config, daemonize, stdio).await
+        }
+        Commands::Recall { project, limit } => {
+            commands::recall::run(cli.config, project, limit).await
         }
         Commands::Status => commands::status::run(cli.json).await,
         Commands::Stop => commands::stop::run().await,

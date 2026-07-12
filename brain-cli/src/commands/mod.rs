@@ -1,4 +1,5 @@
 pub mod init;
+pub mod recall;
 pub mod reindex;
 pub mod serve;
 pub mod status;
