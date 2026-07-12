@@ -115,6 +115,7 @@ fn deterministic_vector(text: &str, dims: usize) -> Vec<f32> {
 pub struct MockIndex {
     store: Mutex<HashMap<String, (Vec<f32>, Metadata)>>,
     model_id: Mutex<Option<String>>,
+    accesses: Mutex<HashMap<String, u32>>,
 }
 
 impl MockIndex {
@@ -122,7 +123,12 @@ impl MockIndex {
         Self {
             store: Mutex::new(HashMap::new()),
             model_id: Mutex::new(None),
+            accesses: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn access_count(&self, id: &str) -> u32 {
+        self.accesses.lock().unwrap().get(id).copied().unwrap_or(0)
     }
 }
 
@@ -201,6 +207,17 @@ impl IndexPort for MockIndex {
                 .filter(|meta| matches_filter(meta, &filter))
                 .cloned()
                 .collect())
+        })
+    }
+
+    fn record_access(&self, ids: &[String]) -> BoxFuture<'_, Result<()>> {
+        let ids = ids.to_vec();
+        Box::pin(async move {
+            let mut accesses = self.accesses.lock().unwrap();
+            for id in ids {
+                *accesses.entry(id).or_insert(0) += 1;
+            }
+            Ok(())
         })
     }
 

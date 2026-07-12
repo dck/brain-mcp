@@ -30,6 +30,7 @@ pub trait IndexPort: Send + Sync {
     ) -> BoxFuture<'_, Result<Vec<SearchResult>>>;
     fn delete(&self, id: &str) -> BoxFuture<'_, Result<()>>;
     fn list(&self, filter: &Filter) -> BoxFuture<'_, Result<Vec<Metadata>>>;
+    fn record_access(&self, ids: &[String]) -> BoxFuture<'_, Result<()>>;
     fn clear(&self) -> BoxFuture<'_, Result<()>>;
     fn stored_model_id(&self) -> BoxFuture<'_, Result<Option<String>>>;
     fn set_model_id(&self, model_id: &str) -> BoxFuture<'_, Result<()>>;

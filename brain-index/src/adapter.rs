@@ -34,6 +34,9 @@ impl SqliteVecIndex {
     }
 }
 
+const RECENCY_WEIGHT: f32 = 0.05;
+const RECENCY_DECAY_DAYS: f32 = 90.0;
+
 fn create_schema(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -43,13 +46,25 @@ fn create_schema(conn: &Connection) -> anyhow::Result<()> {
              tags TEXT NOT NULL,
              category TEXT NOT NULL,
              project TEXT,
-             created_at TEXT NOT NULL
+             created_at TEXT NOT NULL,
+             access_count INTEGER NOT NULL DEFAULT 0,
+             last_accessed_at TEXT
          );
          CREATE TABLE IF NOT EXISTS memory_vectors (
              id TEXT PRIMARY KEY,
              embedding BLOB NOT NULL
          );",
     )?;
+    for stmt in [
+        "ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE memories ADD COLUMN last_accessed_at TEXT",
+    ] {
+        if let Err(e) = conn.execute(stmt, [])
+            && !e.to_string().contains("duplicate column name")
+        {
+            return Err(e.into());
+        }
+    }
     Ok(())
 }
 
@@ -139,7 +154,9 @@ impl IndexPort for SqliteVecIndex {
             let blob = f32_slice_to_bytes(&embedding);
 
             conn.execute(
-                "INSERT OR REPLACE INTO memories (id, title, tags, category, project, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO memories (id, title, tags, category, project, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET title = excluded.title, tags = excluded.tags,
+                     category = excluded.category, project = excluded.project, created_at = excluded.created_at",
                 rusqlite::params![id, metadata.title, tags_json, metadata.category, metadata.project, created_at_str],
             ).map_err(|e| BrainError::Index(e.to_string()))?;
 
@@ -164,50 +181,41 @@ impl IndexPort for SqliteVecIndex {
         Box::pin(async move {
             let conn = self.conn.lock().await;
 
-            // Load all vectors
             let mut stmt = conn
-                .prepare("SELECT id, embedding FROM memory_vectors")
+                .prepare(
+                    "SELECT m.id, m.title, m.tags, m.category, m.project, m.created_at, v.embedding
+                     FROM memories m JOIN memory_vectors v ON v.id = m.id",
+                )
                 .map_err(|e| BrainError::Index(e.to_string()))?;
 
-            let scored: Vec<(String, f32)> = stmt
+            let now = Utc::now();
+            // Rank by cosine similarity plus a small recency boost so fresher
+            // memories win near-ties; the reported score stays pure cosine.
+            let mut scored: Vec<(Metadata, f32, f32)> = stmt
                 .query_map([], |row| {
-                    let id: String = row.get(0)?;
-                    let blob: Vec<u8> = row.get(1)?;
-                    Ok((id, blob))
+                    let meta = row_to_metadata(row)?;
+                    let blob: Vec<u8> = row.get(6)?;
+                    Ok((meta, blob))
                 })
                 .map_err(|e| BrainError::Index(e.to_string()))?
                 .filter_map(|r| r.ok())
-                .map(|(id, blob)| {
+                .filter(|(meta, _)| matches_filter(meta, &filter))
+                .map(|(meta, blob)| {
                     let vec = bytes_to_f32_vec(&blob);
                     let score = cosine_similarity(&embedding, &vec);
-                    (id, score)
+                    let age_days =
+                        ((now - meta.created_at).num_seconds() as f32 / 86_400.0).max(0.0);
+                    let ranking = score + RECENCY_WEIGHT * (-age_days / RECENCY_DECAY_DAYS).exp();
+                    (meta, score, ranking)
                 })
                 .collect();
 
-            // Sort descending by score
-            let mut scored = scored;
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(limit);
 
-            // For each candidate, load metadata, apply filter, collect up to limit
-            let mut results = Vec::new();
-            for (id, score) in scored {
-                if results.len() >= limit {
-                    break;
-                }
-
-                let meta = conn
-                    .query_row(
-                        "SELECT id, title, tags, category, project, created_at FROM memories WHERE id = ?1",
-                        rusqlite::params![id],
-                        row_to_metadata,
-                    )
-                    .map_err(|e| BrainError::Index(e.to_string()))?;
-
-                if !matches_filter(&meta, &filter) {
-                    continue;
-                }
-
-                results.push(SearchResult {
+            Ok(scored
+                .into_iter()
+                .map(|(meta, score, _)| SearchResult {
                     memory: Memory {
                         id: meta.id,
                         title: meta.title,
@@ -218,10 +226,8 @@ impl IndexPort for SqliteVecIndex {
                         created_at: meta.created_at,
                     },
                     score,
-                });
-            }
-
-            Ok(results)
+                })
+                .collect())
         })
     }
 
@@ -256,6 +262,22 @@ impl IndexPort for SqliteVecIndex {
                 .collect();
 
             Ok(all)
+        })
+    }
+
+    fn record_access(&self, ids: &[String]) -> BoxFuture<'_, Result<()>> {
+        let ids = ids.to_vec();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let now = Utc::now().to_rfc3339();
+            for id in &ids {
+                conn.execute(
+                    "UPDATE memories SET access_count = access_count + 1, last_accessed_at = ?1 WHERE id = ?2",
+                    rusqlite::params![now, id],
+                )
+                .map_err(|e| BrainError::Index(e.to_string()))?;
+            }
+            Ok(())
         })
     }
 
@@ -461,6 +483,70 @@ mod tests {
             .await
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_search_recency_breaks_ties() {
+        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+
+        let mut old = make_metadata("old", "learnings", vec![], None);
+        old.created_at = Utc::now() - chrono::Duration::days(365);
+        let fresh = make_metadata("fresh", "learnings", vec![], None);
+
+        index.upsert("old", &[1.0, 0.0, 0.0], &old).await.unwrap();
+        index
+            .upsert("fresh", &[1.0, 0.0, 0.0], &fresh)
+            .await
+            .unwrap();
+
+        let results = index
+            .search(&[1.0, 0.0, 0.0], 2, &Filter::default())
+            .await
+            .unwrap();
+        assert_eq!(results[0].memory.id, "fresh");
+        assert_eq!(results[1].memory.id, "old");
+        assert!((results[0].score - results[1].score).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn test_record_access_increments() {
+        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let meta = make_metadata("m1", "learnings", vec![], None);
+        index.upsert("m1", &[1.0, 0.0, 0.0], &meta).await.unwrap();
+
+        index.record_access(&["m1".to_string()]).await.unwrap();
+        index.record_access(&["m1".to_string()]).await.unwrap();
+
+        let conn = index.conn.lock().await;
+        let (count, last): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT access_count, last_accessed_at FROM memories WHERE id = 'm1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(last.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_upsert_preserves_access_count() {
+        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let meta = make_metadata("m1", "learnings", vec![], None);
+        index.upsert("m1", &[1.0, 0.0, 0.0], &meta).await.unwrap();
+        index.record_access(&["m1".to_string()]).await.unwrap();
+
+        index.upsert("m1", &[0.0, 1.0, 0.0], &meta).await.unwrap();
+
+        let conn = index.conn.lock().await;
+        let count: i64 = conn
+            .query_row(
+                "SELECT access_count FROM memories WHERE id = 'm1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]

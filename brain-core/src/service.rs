@@ -73,6 +73,11 @@ impl MemoryService {
         let mut results = self.index.search(&embedding, limit, filter).await?;
         results.retain(|r| r.score >= self.min_score);
 
+        if !results.is_empty() {
+            let ids: Vec<String> = results.iter().map(|r| r.memory.id.clone()).collect();
+            self.index.record_access(&ids).await?;
+        }
+
         let mut hydrated = Vec::with_capacity(results.len());
         for result in results {
             let memory = self
@@ -257,6 +262,33 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].memory.title, "Rust Lifetimes");
+    }
+
+    #[tokio::test]
+    async fn test_search_records_access() {
+        let (_vault, _embedder, index, svc) = make_service();
+
+        let mem = svc
+            .store(
+                "Accessed Memory".into(),
+                "some searchable content".into(),
+                vec![],
+                "learnings".into(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(index.access_count(&mem.id), 0);
+
+        svc.search("some searchable content", 10, &Filter::default())
+            .await
+            .unwrap();
+        svc.search("some searchable content", 10, &Filter::default())
+            .await
+            .unwrap();
+
+        assert_eq!(index.access_count(&mem.id), 2);
     }
 
     #[tokio::test]
