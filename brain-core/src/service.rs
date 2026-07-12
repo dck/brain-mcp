@@ -7,6 +7,8 @@ use crate::id::generate_id;
 use crate::model::{Filter, Memory, Metadata, SearchResult};
 use crate::ports::{EmbeddingPort, IndexPort, VaultPort};
 
+const DUPLICATE_THRESHOLD: f32 = 0.9;
+
 pub struct MemoryService {
     vault: Arc<dyn VaultPort>,
     embedder: Arc<dyn EmbeddingPort>,
@@ -40,9 +42,30 @@ impl MemoryService {
         tags: Vec<String>,
         category: String,
         project: Option<String>,
+        force: bool,
     ) -> Result<Memory> {
         let now = Utc::now();
         let id = generate_id(&title, now);
+
+        let embedding = self.embedder.embed(&content).await?;
+
+        if !force {
+            if self.vault.read(&id).await?.is_some() {
+                return Err(BrainError::AlreadyExists(format!(
+                    "{id} — extend it with memory_update, or retry with force=true to overwrite"
+                )));
+            }
+            let similar = self.index.search(&embedding, 1, &Filter::default()).await?;
+            if let Some(top) = similar.first()
+                && top.score >= DUPLICATE_THRESHOLD
+            {
+                return Err(BrainError::Duplicate {
+                    id: top.memory.id.clone(),
+                    title: top.memory.title.clone(),
+                    score: top.score,
+                });
+            }
+        }
 
         let memory = Memory {
             id,
@@ -56,7 +79,6 @@ impl MemoryService {
 
         self.vault.write(&memory).await?;
 
-        let embedding = self.embedder.embed(&memory.content).await?;
         let metadata = Metadata::from(&memory);
         self.index.upsert(&memory.id, &embedding, &metadata).await?;
 
@@ -198,6 +220,7 @@ mod tests {
                 vec!["rust".into()],
                 "learnings".into(),
                 Some("brain-mcp".into()),
+                false,
             )
             .await
             .unwrap();
@@ -226,6 +249,7 @@ mod tests {
                 vec![],
                 "learnings".into(),
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -247,6 +271,7 @@ mod tests {
             vec!["rust".into()],
             "learnings".into(),
             None,
+            false,
         )
         .await
         .unwrap();
@@ -275,6 +300,7 @@ mod tests {
                 vec![],
                 "learnings".into(),
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -304,6 +330,7 @@ mod tests {
             vec![],
             "learnings".into(),
             None,
+            false,
         )
         .await
         .unwrap();
@@ -335,6 +362,7 @@ mod tests {
             vec![],
             "learnings".into(),
             None,
+            false,
         )
         .await
         .unwrap();
@@ -352,13 +380,27 @@ mod tests {
     async fn test_list_delegates_to_index() {
         let (_vault, _embedder, _index, svc) = make_service();
 
-        svc.store("A".into(), "a".into(), vec![], "learnings".into(), None)
-            .await
-            .unwrap();
+        svc.store(
+            "A".into(),
+            "a".into(),
+            vec![],
+            "learnings".into(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
 
-        svc.store("B".into(), "b".into(), vec![], "decisions".into(), None)
-            .await
-            .unwrap();
+        svc.store(
+            "B".into(),
+            "b".into(),
+            vec![],
+            "decisions".into(),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
 
         let filter = Filter {
             category: Some("decisions".into()),
@@ -367,6 +409,91 @@ mod tests {
         let listed = svc.list(&filter).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].category, "decisions");
+    }
+
+    #[tokio::test]
+    async fn test_store_rejects_near_duplicate_content() {
+        let (_vault, _embedder, _index, svc) = make_service();
+
+        svc.store(
+            "Original".into(),
+            "identical content body".into(),
+            vec![],
+            "learnings".into(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let result = svc
+            .store(
+                "Different Title".into(),
+                "identical content body".into(),
+                vec![],
+                "learnings".into(),
+                None,
+                false,
+            )
+            .await;
+
+        assert!(matches!(result.unwrap_err(), BrainError::Duplicate { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_store_force_bypasses_duplicate_check() {
+        let (_vault, _embedder, _index, svc) = make_service();
+
+        svc.store(
+            "Original".into(),
+            "identical content body".into(),
+            vec![],
+            "learnings".into(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        svc.store(
+            "Different Title".into(),
+            "identical content body".into(),
+            vec![],
+            "learnings".into(),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_store_rejects_same_id_overwrite() {
+        let (_vault, _embedder, _index, svc) = make_service();
+
+        svc.store(
+            "Same Title".into(),
+            "first version".into(),
+            vec![],
+            "learnings".into(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let result = svc
+            .store(
+                "Same Title".into(),
+                "completely unrelated second version 12345".into(),
+                vec![],
+                "learnings".into(),
+                None,
+                false,
+            )
+            .await;
+
+        assert!(matches!(result.unwrap_err(), BrainError::AlreadyExists(_)));
     }
 
     #[tokio::test]
@@ -380,6 +507,7 @@ mod tests {
                 vec!["tag1".into()],
                 "learnings".into(),
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -417,6 +545,7 @@ mod tests {
                 vec![],
                 "learnings".into(),
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -438,6 +567,7 @@ mod tests {
                 vec![],
                 "learnings".into(),
                 None,
+                true,
             )
             .await
             .unwrap();

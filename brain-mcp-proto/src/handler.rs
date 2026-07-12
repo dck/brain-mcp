@@ -97,7 +97,9 @@ impl McpHandler {
             Ok(value) => Response::success(request.id, value),
             Err(e) => {
                 let code = match &e {
-                    BrainError::NotFound(_) => INVALID_PARAMS,
+                    BrainError::NotFound(_)
+                    | BrainError::AlreadyExists(_)
+                    | BrainError::Duplicate { .. } => INVALID_PARAMS,
                     _ => INTERNAL_ERROR,
                 };
                 Response::error(request.id, code, e.to_string())
@@ -129,10 +131,11 @@ impl McpHandler {
             .get("project")
             .and_then(|v| v.as_str())
             .map(String::from);
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let memory = self
             .service
-            .store(title, content, tags, category, project)
+            .store(title, content, tags, category, project, force)
             .await?;
 
         Ok(text_content(serde_json::to_string(&memory).unwrap()))

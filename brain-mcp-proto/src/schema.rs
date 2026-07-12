@@ -30,6 +30,11 @@ pub fn tool_definitions() -> Vec<Value> {
                     "project": {
                         "type": "string",
                         "description": "Project name if this memory is project-specific. Omit for cross-project knowledge."
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Store even if a very similar memory already exists. Default false: near-duplicates are rejected with a pointer to the existing memory — prefer extending it via memory_update.",
+                        "default": false
                     }
                 },
                 "required": ["content", "title", "tags"]

@@ -8,6 +8,15 @@ pub enum BrainError {
     #[error("Memory already exists: {0}")]
     AlreadyExists(String),
 
+    #[error(
+        "A very similar memory already exists: {id} (\"{title}\", similarity {score:.2}). Extend it with memory_update, or retry with force=true to store anyway."
+    )]
+    Duplicate {
+        id: String,
+        title: String,
+        score: f32,
+    },
+
     #[error("Invalid category: {0}")]
     InvalidCategory(String),
 
