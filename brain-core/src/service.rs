@@ -11,6 +11,7 @@ pub struct MemoryService {
     vault: Arc<dyn VaultPort>,
     embedder: Arc<dyn EmbeddingPort>,
     index: Arc<dyn IndexPort>,
+    min_score: f32,
 }
 
 impl MemoryService {
@@ -23,7 +24,13 @@ impl MemoryService {
             vault,
             embedder,
             index,
+            min_score: 0.0,
         }
+    }
+
+    pub fn with_min_score(mut self, min_score: f32) -> Self {
+        self.min_score = min_score;
+        self
     }
 
     pub async fn store(
@@ -63,7 +70,8 @@ impl MemoryService {
         filter: &Filter,
     ) -> Result<Vec<SearchResult>> {
         let embedding = self.embedder.embed(query).await?;
-        let results = self.index.search(&embedding, limit, filter).await?;
+        let mut results = self.index.search(&embedding, limit, filter).await?;
+        results.retain(|r| r.score >= self.min_score);
 
         let mut hydrated = Vec::with_capacity(results.len());
         for result in results {
@@ -249,6 +257,40 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].memory.title, "Rust Lifetimes");
+    }
+
+    #[tokio::test]
+    async fn test_search_filters_below_min_score() {
+        let vault = Arc::new(MockVault::new());
+        let embedder = Arc::new(MockEmbedder::new(8));
+        let index = Arc::new(MockIndex::new());
+        let svc = MemoryService::new(vault, embedder, index).with_min_score(0.99);
+
+        svc.store(
+            "Rust Lifetimes".into(),
+            "Lifetimes ensure references are valid".into(),
+            vec![],
+            "learnings".into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let exact = svc
+            .search(
+                "Lifetimes ensure references are valid",
+                10,
+                &Filter::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact.len(), 1);
+
+        let unrelated = svc
+            .search("completely different topic", 10, &Filter::default())
+            .await
+            .unwrap();
+        assert!(unrelated.is_empty());
     }
 
     #[tokio::test]

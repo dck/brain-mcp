@@ -6,6 +6,8 @@ pub struct Config {
     pub embedding: EmbeddingConfig,
     pub index: IndexConfig,
     pub server: ServerConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +34,20 @@ pub struct IndexConfig {
     #[serde(default = "default_backend")]
     pub backend: String,
     pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchConfig {
+    #[serde(default = "default_min_score")]
+    pub min_score: f32,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            min_score: default_min_score(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +100,10 @@ fn default_backend() -> String {
     "sqlite-vec".into()
 }
 
+fn default_min_score() -> f32 {
+    0.25
+}
+
 fn default_http_port() -> u16 {
     47200
 }
@@ -114,6 +134,7 @@ mod tests {
         assert_eq!(config.index.path, "~/.config/brain-mcp/index.db");
         assert_eq!(config.server.http_port, 47200);
         assert_eq!(config.server.grace_period_seconds, 60);
+        assert_eq!(config.search.min_score, 0.25);
     }
 
     #[test]

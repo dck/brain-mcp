@@ -149,8 +149,10 @@ async fn full_roundtrip() {
         "search-after-delete failed: {resp}"
     );
     let empty_text = resp["result"]["content"][0]["text"].as_str().unwrap();
-    let empty_results: Vec<serde_json::Value> = serde_json::from_str(empty_text).unwrap();
-    assert!(empty_results.is_empty(), "expected no results after delete");
+    assert_eq!(
+        empty_text, "No relevant memories found for this query.",
+        "expected no results after delete"
+    );
 
     // 10. Reindex (should return 0 since the memory was deleted)
     let resp = tool_call(&client, &url, "memory_reindex", json!({})).await;

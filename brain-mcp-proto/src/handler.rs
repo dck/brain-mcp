@@ -151,6 +151,12 @@ impl McpHandler {
 
         let results = self.service.search(query, limit, &filter).await?;
 
+        if results.is_empty() {
+            return Ok(text_content(
+                "No relevant memories found for this query.".to_string(),
+            ));
+        }
+
         let output: Vec<serde_json::Value> = results
             .iter()
             .map(|r| {
@@ -360,6 +366,30 @@ mod tests {
         let results: Vec<serde_json::Value> = serde_json::from_str(text).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["memory"]["title"], "Rust Lifetimes");
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_memory_search_empty() {
+        let vault = Arc::new(MockVault::new());
+        let embedder = Arc::new(MockEmbedder::new(8));
+        let index = Arc::new(MockIndex::new());
+        let service = Arc::new(MemoryService::new(vault, embedder, index).with_min_score(0.99));
+        let handler = McpHandler::new(service);
+
+        let req = make_request(
+            "tools/call",
+            Some(json!(1)),
+            Some(json!({
+                "name": "memory_search",
+                "arguments": { "query": "anything" }
+            })),
+        );
+        let resp = handler.handle(req).await;
+
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "No relevant memories found for this query.");
     }
 
     #[tokio::test]

@@ -15,3 +15,6 @@ path = "~/.config/brain-mcp/index.db"
 [server]
 http_port = 47200
 grace_period_seconds = 60
+
+[search]
+min_score = 0.25

@@ -44,7 +44,9 @@ pub async fn run(
     let index = Arc::new(SqliteVecIndex::open(&index_path, embedder.dimensions())?);
 
     // 3. Build service
-    let service = Arc::new(MemoryService::new(vault, embedder.clone(), index));
+    let service = Arc::new(
+        MemoryService::new(vault, embedder.clone(), index).with_min_score(config.search.min_score),
+    );
 
     // 4. Check model compatibility
     if let Err(e) = service.check_model_compatibility().await {
