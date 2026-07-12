@@ -338,19 +338,43 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
 
     println!();
     println!("  {}", console::style("Next steps:").bold());
+    let mut step = 1;
     if resolved.embedding.provider == "openai" {
         println!(
-            "    1. Set your {} env var",
+            "    {step}. Set your {} env var",
             console::style("OPENAI_API_KEY").bold()
         );
-        println!("    2. Run {}", console::style("brain-mcp serve").bold());
-    } else {
-        println!("    Run {}", console::style("brain-mcp serve").bold());
+        step += 1;
     }
+    println!(
+        "    {step}. Register with Claude Code:\n       {}",
+        console::style(
+            "claude mcp add --scope user --transport stdio brain-mcp -- brain-mcp serve --stdio"
+        )
+        .bold()
+    );
+    step += 1;
+    println!(
+        "    {step}. Recommended: add a SessionStart hook so every session starts with a memory index\n       (models rarely call memory_search unprompted). In ~/.claude/settings.json:"
+    );
+    println!("{}", console::style(SESSION_START_HOOK_SNIPPET).dim());
     println!();
 
     Ok(())
 }
+
+const SESSION_START_HOOK_SNIPPET: &str = r#"       {
+         "hooks": {
+           "SessionStart": [{
+             "matcher": "startup|resume|clear",
+             "hooks": [{
+               "type": "command",
+               "command": "brain-mcp recall --project \"$(basename \"$PWD\")\"",
+               "timeout": 10
+             }]
+           }]
+         }
+       }"#;
 
 fn load_existing_config() -> Option<Config> {
     let path = default_config_path();

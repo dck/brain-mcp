@@ -73,6 +73,32 @@ claude mcp add --scope user --transport stdio brain-mcp -- brain-mcp serve --std
 
 Restart Claude Code. The server starts automatically when Claude Code connects.
 
+### Automatic recall (recommended)
+
+Models rarely call `memory_search` unprompted — without a nudge, memory degrades
+into write-only storage. Add a `SessionStart` hook so every session begins with a
+compact index of your memories injected into context; the model then drills down
+with `memory_search` when something looks relevant. In `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{
+      "matcher": "startup|resume|clear",
+      "hooks": [{
+        "type": "command",
+        "command": "brain-mcp recall --project \"$(basename \"$PWD\")\"",
+        "timeout": 10
+      }]
+    }]
+  }
+}
+```
+
+`brain-mcp recall` reads the vault directly (no server, no embeddings), prints one
+line per memory (newest first), and includes cross-project memories alongside the
+`--project` ones.
+
 ## Architecture
 
 Hexagonal (ports & adapters). The core domain has no knowledge of transport, storage backend, or embedding provider.
@@ -119,6 +145,7 @@ The integration tests in the auth module were flaking because...
 ```bash
 brain-mcp init       # interactive setup wizard
 brain-mcp serve      # start HTTP server (foreground)
+brain-mcp recall     # print memory index (for SessionStart hooks)
 brain-mcp status     # show server status
 brain-mcp stop       # stop the server
 brain-mcp reindex    # rebuild search index from vault
