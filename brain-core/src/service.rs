@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
+use tracing::warn;
 
 use crate::error::{BrainError, Result};
 use crate::id::generate_id;
@@ -102,11 +103,14 @@ impl MemoryService {
 
         let mut hydrated = Vec::with_capacity(results.len());
         for result in results {
-            let memory = self
-                .vault
-                .read(&result.memory.id)
-                .await?
-                .unwrap_or(result.memory);
+            let memory = match self.vault.read(&result.memory.id).await {
+                Ok(Some(memory)) => memory,
+                Ok(None) => result.memory,
+                Err(e) => {
+                    warn!("hydrating {} from vault failed: {e}", result.memory.id);
+                    result.memory
+                }
+            };
             hydrated.push(SearchResult {
                 memory,
                 score: result.score,
@@ -277,6 +281,60 @@ mod tests {
         .unwrap();
 
         let results = svc
+            .search(
+                "Lifetimes ensure references are valid",
+                10,
+                &Filter::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].memory.title, "Rust Lifetimes");
+    }
+
+    struct UnreadableVault;
+
+    impl VaultPort for UnreadableVault {
+        fn write(&self, _memory: &Memory) -> crate::ports::BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn read(&self, _id: &str) -> crate::ports::BoxFuture<'_, Result<Option<Memory>>> {
+            Box::pin(async {
+                Err(BrainError::Vault(
+                    "failed to parse frontmatter: missing field `category`".into(),
+                ))
+            })
+        }
+
+        fn delete(&self, _id: &str) -> crate::ports::BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn list_all(&self) -> crate::ports::BoxFuture<'_, Result<Vec<Memory>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_search_survives_unreadable_vault_file() {
+        let (_vault, embedder, index, svc) = make_service();
+
+        svc.store(
+            "Rust Lifetimes".into(),
+            "Lifetimes ensure references are valid".into(),
+            vec!["rust".into()],
+            "learnings".into(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let broken = MemoryService::new(Arc::new(UnreadableVault), embedder, index);
+
+        let results = broken
             .search(
                 "Lifetimes ensure references are valid",
                 10,

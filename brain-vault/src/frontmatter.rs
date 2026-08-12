@@ -10,6 +10,7 @@ struct Frontmatter {
     created_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     project: Option<String>,
+    #[serde(default)]
     category: String,
     id: String,
 }
@@ -126,6 +127,24 @@ Steps to deploy a new app."#;
         assert_eq!(memory.tags, vec!["deploy", "terraform"]);
         assert_eq!(memory.project, Some("maestro".into()));
         assert_eq!(memory.content, "Steps to deploy a new app.");
+    }
+
+    #[test]
+    fn test_parse_missing_category_is_tolerated() {
+        let md = r#"---
+title: "Rust Design Patterns book"
+tags:
+  - rust
+created_at: "2026-04-28T11:21:40Z"
+id: "20260428-rust-design-patterns-book"
+---
+
+Body text."#;
+
+        let memory = parse_markdown(md).unwrap();
+        assert_eq!(memory.category, "");
+        assert_eq!(memory.id, "20260428-rust-design-patterns-book");
+        assert_eq!(memory.content, "Body text.");
     }
 
     #[test]

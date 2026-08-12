@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use brain_core::error::{BrainError, Result};
 use brain_core::model::Memory;
@@ -7,6 +7,15 @@ use tracing::warn;
 
 use crate::frontmatter::{parse_markdown, to_markdown};
 use crate::template::{apply_template, load_template};
+
+fn fill_category_from_path(memory: &mut Memory, path: &Path) {
+    if !memory.category.is_empty() {
+        return;
+    }
+    if let Some(dir) = path.parent().and_then(|p| p.file_name()) {
+        memory.category = dir.to_string_lossy().into_owned();
+    }
+}
 
 pub struct VaultAdapter {
     vault_path: PathBuf,
@@ -84,7 +93,8 @@ impl VaultPort for VaultAdapter {
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| BrainError::Vault(format!("failed to read file: {e}")))?;
 
-            let memory = parse_markdown(&text)?;
+            let mut memory = parse_markdown(&text)?;
+            fill_category_from_path(&mut memory, &path);
             Ok(Some(memory))
         })
     }
@@ -128,7 +138,10 @@ impl VaultPort for VaultAdapter {
                     if file_path.extension().is_some_and(|ext| ext == "md") {
                         match std::fs::read_to_string(&file_path) {
                             Ok(text) => match parse_markdown(&text) {
-                                Ok(memory) => memories.push(memory),
+                                Ok(mut memory) => {
+                                    fill_category_from_path(&mut memory, &file_path);
+                                    memories.push(memory);
+                                }
                                 Err(e) => {
                                     warn!("skipping {}: {e}", file_path.display());
                                 }
@@ -201,6 +214,57 @@ mod tests {
 
         let result = adapter.read("nonexistent-id").await.unwrap();
         assert!(result.is_none());
+    }
+
+    fn write_raw(dir: &std::path::Path, category: &str, id: &str, frontmatter_extra: &str) {
+        let category_dir = dir.join(category);
+        std::fs::create_dir_all(&category_dir).unwrap();
+        std::fs::write(
+            category_dir.join(format!("{id}.md")),
+            format!(
+                "---\ntitle: \"Untouched by the writer\"\ntags:\n  - rust\ncreated_at: \"2026-04-28T11:21:40Z\"\nid: \"{id}\"\n{frontmatter_extra}---\n\nBody text."
+            ),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_recovers_missing_category_from_directory() {
+        let dir = tempdir().unwrap();
+        let adapter = VaultAdapter::new(dir.path().to_path_buf(), "_templates".into());
+
+        write_raw(dir.path(), "concepts", "20260428-no-category", "");
+
+        let memory = adapter.read("20260428-no-category").await.unwrap().unwrap();
+        assert_eq!(memory.category, "concepts");
+    }
+
+    #[tokio::test]
+    async fn test_list_all_recovers_missing_category_from_directory() {
+        let dir = tempdir().unwrap();
+        let adapter = VaultAdapter::new(dir.path().to_path_buf(), "_templates".into());
+
+        write_raw(dir.path(), "concepts", "20260428-no-category", "");
+
+        let all = adapter.list_all().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].category, "concepts");
+    }
+
+    #[tokio::test]
+    async fn test_read_keeps_explicit_category_over_directory() {
+        let dir = tempdir().unwrap();
+        let adapter = VaultAdapter::new(dir.path().to_path_buf(), "_templates".into());
+
+        write_raw(
+            dir.path(),
+            "concepts",
+            "20260428-explicit",
+            "category: learnings\n",
+        );
+
+        let memory = adapter.read("20260428-explicit").await.unwrap().unwrap();
+        assert_eq!(memory.category, "learnings");
     }
 
     #[tokio::test]
