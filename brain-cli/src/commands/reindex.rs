@@ -100,7 +100,8 @@ async fn reindex_local(config_path: Option<PathBuf>, json_output: bool) -> anyho
     }
     let index = Arc::new(SqliteVecIndex::open(&index_path, embedder.dimensions())?);
 
-    let service = MemoryService::new(vault, embedder, index);
+    let service =
+        MemoryService::new(vault, embedder, index).with_categories(config.vault.categories.clone());
     let count = service.reindex().await?;
 
     if let Some(sp) = spinner {

@@ -99,7 +99,8 @@ impl McpHandler {
                 let code = match &e {
                     BrainError::NotFound(_)
                     | BrainError::AlreadyExists(_)
-                    | BrainError::Duplicate { .. } => INVALID_PARAMS,
+                    | BrainError::Duplicate { .. }
+                    | BrainError::InvalidCategory { .. } => INVALID_PARAMS,
                     _ => INTERNAL_ERROR,
                 };
                 Response::error(request.id, code, e.to_string())
@@ -432,5 +433,44 @@ mod tests {
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
         assert_eq!(err.code, METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_store_invalid_category() {
+        let handler = make_handler();
+        let req = make_request(
+            "tools/call",
+            Some(json!(6)),
+            Some(json!({
+                "name": "memory_store",
+                "arguments": {
+                    "title": "Test Memory",
+                    "content": "Some content here",
+                    "tags": [],
+                    "category": "feedback"
+                }
+            })),
+        );
+        let resp = handler.handle(req).await;
+
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert!(err.message.contains("Allowed categories:"));
+    }
+
+    #[tokio::test]
+    async fn test_store_schema_lists_all_default_categories() {
+        let tools = tool_definitions();
+        let store = tools.iter().find(|t| t["name"] == "memory_store").unwrap();
+        let description = store["inputSchema"]["properties"]["category"]["description"]
+            .as_str()
+            .unwrap();
+
+        for category in brain_core::config::default_categories() {
+            assert!(
+                description.contains(&category),
+                "description missing category {category}"
+            );
+        }
     }
 }

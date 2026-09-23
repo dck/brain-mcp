@@ -17,8 +17,11 @@ pub enum BrainError {
         score: f32,
     },
 
-    #[error("Invalid category: {0}")]
-    InvalidCategory(String),
+    #[error("Invalid category '{category}'. Allowed categories: {}", allowed.join(", "))]
+    InvalidCategory {
+        category: String,
+        allowed: Vec<String>,
+    },
 
     #[error("Embedding model mismatch: index has '{stored}', config has '{configured}'")]
     ModelMismatch { stored: String, configured: String },

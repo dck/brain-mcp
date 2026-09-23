@@ -83,7 +83,7 @@ fn default_templates_dir() -> String {
     "_templates".into()
 }
 
-fn default_categories() -> Vec<String> {
+pub fn default_categories() -> Vec<String> {
     vec![
         "procedures",
         "decisions",

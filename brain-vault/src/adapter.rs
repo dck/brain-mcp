@@ -8,6 +8,15 @@ use tracing::warn;
 use crate::frontmatter::{parse_markdown, to_markdown};
 use crate::template::{apply_template, load_template};
 
+fn is_safe_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.starts_with('.')
+        && !s.starts_with('_')
+        && !s.contains(['/', '\\', '\0'])
+}
+
 fn fill_category_from_path(memory: &mut Memory, path: &Path) {
     if !memory.category.is_empty() {
         return;
@@ -36,6 +45,9 @@ impl VaultAdapter {
 
     /// Scan category directories for a file named `{id}.md`.
     fn find_file(&self, id: &str) -> Option<PathBuf> {
+        if !is_safe_component(id) {
+            return None;
+        }
         let filename = format!("{id}.md");
         let entries = std::fs::read_dir(&self.vault_path).ok()?;
 
@@ -63,6 +75,18 @@ impl VaultPort for VaultAdapter {
     fn write(&self, memory: &Memory) -> BoxFuture<'_, Result<()>> {
         let memory = memory.clone();
         Box::pin(async move {
+            if !is_safe_component(&memory.category) {
+                return Err(BrainError::Vault(format!(
+                    "unsafe category path component: {:?}",
+                    memory.category
+                )));
+            }
+            if !is_safe_component(&memory.id) {
+                return Err(BrainError::Vault(format!(
+                    "unsafe memory id: {:?}",
+                    memory.id
+                )));
+            }
             let path = self.memory_path(&memory.category, &memory.id);
 
             let mut on_disk = memory.clone();
@@ -450,5 +474,62 @@ mod tests {
         // Should have standard frontmatter format
         assert!(content.contains("title: Title for 20260328-plain"));
         assert!(content.starts_with("---\nid: "));
+    }
+
+    #[tokio::test]
+    async fn test_write_rejects_traversal_category() {
+        let dir = tempdir().unwrap();
+        let vault_dir = dir.path().join("vault");
+        let adapter = VaultAdapter::new(vault_dir.clone(), "_templates".into());
+
+        let memory = sample_memory("20260328-escape", "../outside");
+        let result = adapter.write(&memory).await;
+
+        assert!(result.is_err());
+        assert!(!dir.path().parent().unwrap().join("outside").exists());
+    }
+
+    #[tokio::test]
+    async fn test_write_rejects_unsafe_ids() {
+        let dir = tempdir().unwrap();
+        let vault_dir = dir.path().join("vault");
+        let adapter = VaultAdapter::new(vault_dir.clone(), "_templates".into());
+
+        for id in ["../x", "a/b", "a\\b", ".hidden", "_tpl", ""] {
+            let memory = sample_memory(id, "procedures");
+            let result = adapter.write(&memory).await;
+            assert!(result.is_err(), "expected error for id {id:?}");
+        }
+        assert!(!dir.path().parent().unwrap().join("x").exists());
+    }
+
+    #[tokio::test]
+    async fn test_write_rejects_underscore_category() {
+        let dir = tempdir().unwrap();
+        let adapter = VaultAdapter::new(dir.path().to_path_buf(), "_templates".into());
+
+        let memory = sample_memory("20260328-templated-write", "_templates");
+        let result = adapter.write(&memory).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_with_traversal_id_returns_none() {
+        let dir = tempdir().unwrap();
+        let vault_dir = dir.path().join("vault");
+        std::fs::create_dir_all(&vault_dir).unwrap();
+        std::fs::write(
+            dir.path().join("secret.md"),
+            "---\ntitle: \"Secret\"\ntags: []\ncategory: procedures\ncreated_at: \"2026-04-28T11:21:40Z\"\nid: \"secret\"\n---\n\nBody text.",
+        )
+        .unwrap();
+        let adapter = VaultAdapter::new(vault_dir, "_templates".into());
+
+        let result = adapter.read("../secret").await.unwrap();
+        assert!(result.is_none());
+
+        adapter.delete("../secret").await.unwrap();
+        assert!(dir.path().join("secret.md").exists());
     }
 }

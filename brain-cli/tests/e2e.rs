@@ -85,6 +85,22 @@ async fn full_roundtrip() {
     let stored: serde_json::Value = serde_json::from_str(content_text).unwrap();
     let memory_id = stored["id"].as_str().unwrap().to_string();
 
+    // 3b. Attempt a path-traversal category
+    let resp = tool_call(
+        &client,
+        &url,
+        "memory_store",
+        json!({
+            "title": "Evil",
+            "content": "malicious content",
+            "tags": [],
+            "category": "../evil"
+        }),
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], -32602);
+    assert!(!tmp.path().parent().unwrap().join("evil").exists());
+
     // 4. Search for it
     let resp = tool_call(
         &client,

@@ -24,7 +24,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     },
                     "category": {
                         "type": "string",
-                        "description": "One of: procedures (how-to guides, step-by-step), decisions (architectural choices, trade-offs), learnings (debugging insights, TILs, mistakes), concepts (reference knowledge, patterns). Default: learnings.",
+                        "description": "One of the categories configured on the server. Defaults: procedures (how-to guides, step-by-step), decisions (architectural choices, trade-offs), learnings (debugging insights, TILs, mistakes), concepts (reference knowledge, patterns), projects (project-level context). Unknown categories are rejected with the allowed list. Default: learnings.",
                         "default": "learnings"
                     },
                     "project": {
@@ -86,7 +86,7 @@ pub fn tool_definitions() -> Vec<Value> {
                         "type": "string",
                         "description": "Only include memories created after this ISO 8601 timestamp (e.g. 2026-03-01T00:00:00Z)"
                     },
-                    "category": { "type": "string", "description": "Filter by category: procedures, decisions, learnings, or concepts" },
+                    "category": { "type": "string", "description": "Filter by category, e.g. procedures, decisions, learnings, concepts, projects" },
                     "project": { "type": "string", "description": "Filter by project name" }
                 },
                 "required": []

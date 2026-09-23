@@ -45,7 +45,9 @@ pub async fn run(
 
     // 3. Build service
     let service = Arc::new(
-        MemoryService::new(vault, embedder.clone(), index).with_min_score(config.search.min_score),
+        MemoryService::new(vault, embedder.clone(), index)
+            .with_min_score(config.search.min_score)
+            .with_categories(config.vault.categories.clone()),
     );
 
     // 4. Check model compatibility

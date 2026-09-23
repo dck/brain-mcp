@@ -4,6 +4,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use tracing::warn;
 
+use crate::config::default_categories;
 use crate::error::{BrainError, Result};
 use crate::id::generate_id;
 use crate::model::{Filter, Memory, Metadata, SearchResult};
@@ -16,6 +17,7 @@ pub struct MemoryService {
     embedder: Arc<dyn EmbeddingPort>,
     index: Arc<dyn IndexPort>,
     min_score: f32,
+    categories: Vec<String>,
 }
 
 impl MemoryService {
@@ -29,12 +31,28 @@ impl MemoryService {
             embedder,
             index,
             min_score: 0.0,
+            categories: default_categories(),
         }
     }
 
     pub fn with_min_score(mut self, min_score: f32) -> Self {
         self.min_score = min_score;
         self
+    }
+
+    pub fn with_categories(mut self, categories: Vec<String>) -> Self {
+        self.categories = categories;
+        self
+    }
+
+    fn validate_category(&self, category: &str) -> Result<()> {
+        if self.categories.iter().any(|c| c == category) {
+            return Ok(());
+        }
+        Err(BrainError::InvalidCategory {
+            category: category.to_string(),
+            allowed: self.categories.clone(),
+        })
     }
 
     pub async fn store(
@@ -46,6 +64,8 @@ impl MemoryService {
         project: Option<String>,
         force: bool,
     ) -> Result<Memory> {
+        self.validate_category(&category)?;
+
         let now = Utc::now();
         let id = generate_id(&title, now);
 
@@ -175,6 +195,18 @@ impl MemoryService {
 
         let memories = self.vault.list_all().await?;
         let count = memories.len();
+
+        let mut unknown: BTreeMap<&str, usize> = BTreeMap::new();
+        for memory in &memories {
+            if !self.categories.iter().any(|c| c == &memory.category) {
+                *unknown.entry(memory.category.as_str()).or_insert(0) += 1;
+            }
+        }
+        for (category, count) in unknown {
+            warn!(
+                "category '{category}' is not configured ({count} memories); they are indexed but new memories cannot use it"
+            );
+        }
 
         for memory in &memories {
             let embedding = self.embedder.embed(&memory.content).await?;
@@ -728,5 +760,155 @@ mod tests {
             result.unwrap_err(),
             BrainError::ModelMismatch { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_store_rejects_unknown_category() {
+        let (vault, embedder, _index, svc) = make_service();
+
+        let result = svc
+            .store(
+                "Title".into(),
+                "content".into(),
+                vec![],
+                "feedback".into(),
+                None,
+                false,
+            )
+            .await;
+
+        match result.unwrap_err() {
+            BrainError::InvalidCategory { category, allowed } => {
+                assert_eq!(category, "feedback");
+                assert_eq!(allowed, default_categories());
+            }
+            other => panic!("expected InvalidCategory, got {other:?}"),
+        }
+        assert!(embedder.calls().is_empty());
+        assert!(vault.list_all().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_store_rejects_path_traversal_category() {
+        let (_vault, _embedder, _index, svc) = make_service();
+
+        let result = svc
+            .store(
+                "Title".into(),
+                "content".into(),
+                vec![],
+                "../escape".into(),
+                None,
+                false,
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            BrainError::InvalidCategory { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_store_accepts_configured_custom_category() {
+        let vault = Arc::new(MockVault::new());
+        let embedder = Arc::new(MockEmbedder::new(8));
+        let index = Arc::new(MockIndex::new());
+        let svc = MemoryService::new(vault, embedder, index).with_categories(vec!["notes".into()]);
+
+        svc.store(
+            "Title".into(),
+            "content".into(),
+            vec![],
+            "notes".into(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let result = svc
+            .store(
+                "Other".into(),
+                "other content".into(),
+                vec![],
+                "learnings".into(),
+                None,
+                false,
+            )
+            .await;
+        assert!(matches!(
+            result.unwrap_err(),
+            BrainError::InvalidCategory { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_category_message_lists_allowed() {
+        let (_vault, _embedder, _index, svc) = make_service();
+
+        let err = svc
+            .store(
+                "Title".into(),
+                "content".into(),
+                vec![],
+                "x".into(),
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid category 'x'. Allowed categories: procedures, decisions, learnings, concepts, projects"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reindex_indexes_unknown_category() {
+        let (vault, _embedder, index, svc) = make_service();
+
+        let memory = Memory {
+            id: "20260328-legacy".into(),
+            title: "Legacy".into(),
+            content: "legacy content".into(),
+            tags: vec![],
+            category: "feedback".into(),
+            project: None,
+            created_at: Utc::now(),
+            updated_at: None,
+            extra: BTreeMap::new(),
+        };
+        vault.write(&memory).await.unwrap();
+
+        let count = svc.reindex().await.unwrap();
+        assert_eq!(count, 1);
+
+        let listed = index.list(&Filter::default()).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].category, "feedback");
+    }
+
+    #[tokio::test]
+    async fn test_update_allows_legacy_category() {
+        let (vault, _embedder, _index, svc) = make_service();
+
+        let memory = Memory {
+            id: "20260328-legacy".into(),
+            title: "Legacy".into(),
+            content: "legacy content".into(),
+            tags: vec![],
+            category: "feedback".into(),
+            project: None,
+            created_at: Utc::now(),
+            updated_at: None,
+            extra: BTreeMap::new(),
+        };
+        vault.write(&memory).await.unwrap();
+
+        svc.update(&memory.id, Some("New Title".into()), None, None)
+            .await
+            .unwrap();
     }
 }
