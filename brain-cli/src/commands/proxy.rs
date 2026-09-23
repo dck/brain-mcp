@@ -80,6 +80,7 @@ impl std::fmt::Display for UpstreamError {
 
 struct Upstream {
     state_dir: PathBuf,
+    config_path: Option<PathBuf>,
     client: reqwest::Client,
     conn: tokio::sync::Mutex<Option<ServerState>>,
     spawn_enabled: bool,
@@ -89,9 +90,10 @@ struct Upstream {
 }
 
 impl Upstream {
-    fn new(state_dir: PathBuf, spawn_enabled: bool) -> Self {
+    fn new(state_dir: PathBuf, spawn_enabled: bool, config_path: Option<PathBuf>) -> Self {
         Self {
             state_dir,
+            config_path,
             client: server_client::loopback_client(),
             conn: tokio::sync::Mutex::new(None),
             spawn_enabled,
@@ -171,7 +173,8 @@ impl Upstream {
             return Err(UpstreamError::StartTimeout);
         }
 
-        let mut child = spawn_server(&self.state_dir).map_err(UpstreamError::Spawn)?;
+        let mut child = spawn_server(&self.state_dir, self.config_path.as_deref())
+            .map_err(UpstreamError::Spawn)?;
         let state = self.wait_for_server(&mut child).await?;
         *guard = Some(state.clone());
         Ok(state)
@@ -355,7 +358,19 @@ fn needs_restart(own: &OwnBuild, state: &ServerState, id: &ServerIdentity) -> bo
     )
 }
 
-fn spawn_server(state_dir: &Path) -> std::io::Result<std::process::Child> {
+fn server_args(config_path: Option<&Path>) -> Vec<std::ffi::OsString> {
+    let mut args = vec![std::ffi::OsString::from("serve")];
+    if let Some(path) = config_path {
+        args.push(std::ffi::OsString::from("--config"));
+        args.push(path.into());
+    }
+    args
+}
+
+fn spawn_server(
+    state_dir: &Path,
+    config_path: Option<&Path>,
+) -> std::io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     std::fs::create_dir_all(state_dir)?;
     let log_path = server_log_path(state_dir);
@@ -376,7 +391,7 @@ fn spawn_server(state_dir: &Path) -> std::io::Result<std::process::Child> {
         .ok_or_else(|| std::io::Error::other("cannot resolve current executable"))?;
     unsafe {
         std::process::Command::new(exe)
-            .arg("serve")
+            .args(server_args(config_path))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(log))
@@ -513,8 +528,8 @@ async fn handle_line(line: String, upstream: Arc<Upstream>) -> Outcome {
     }
 }
 
-pub async fn run(state_dir: PathBuf) -> anyhow::Result<()> {
-    let upstream = Arc::new(Upstream::new(state_dir, true));
+pub async fn run(state_dir: PathBuf, config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let upstream = Arc::new(Upstream::new(state_dir, true, config_path));
     let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(32);
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -591,7 +606,7 @@ mod tests {
     #[tokio::test]
     async fn initialize_answered_locally() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false));
+        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false, None));
         let start = Instant::now();
         let outcome = handle_line(
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#
@@ -607,7 +622,7 @@ mod tests {
     #[tokio::test]
     async fn tools_list_answered_locally() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false));
+        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false, None));
         let outcome = handle_line(
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#.to_string(),
             upstream,
@@ -621,7 +636,7 @@ mod tests {
     #[tokio::test]
     async fn ping_answered_locally() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false));
+        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false, None));
         let outcome = handle_line(
             r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#.to_string(),
             upstream,
@@ -634,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn notification_is_silent() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false));
+        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false, None));
         let outcome = handle_line(
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string(),
             upstream.clone(),
@@ -654,7 +669,7 @@ mod tests {
     #[tokio::test]
     async fn null_id_is_request() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false));
+        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false, None));
         let outcome = handle_line(
             r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#.to_string(),
             upstream,
@@ -667,7 +682,7 @@ mod tests {
     #[tokio::test]
     async fn parse_error_reply() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false));
+        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false, None));
         let outcome = handle_line("not json".to_string(), upstream).await;
         let resp = value_of(outcome);
         assert_eq!(resp["error"]["code"], -32700);
@@ -676,7 +691,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_method_is_method_not_found() {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false));
+        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false, None));
         let outcome = handle_line(
             r#"{"jsonrpc":"2.0","id":1,"method":"resources/list"}"#.to_string(),
             upstream,
@@ -694,7 +709,7 @@ mod tests {
             "line1\nError: ONNX support not compiled in",
         )
         .unwrap();
-        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false));
+        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false, None));
         let outcome = handle_line(
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"x"}}}"#
                 .to_string(),
@@ -707,6 +722,19 @@ mod tests {
         assert!(text.starts_with("brain-mcp server is unavailable:"));
         assert!(text.contains("ONNX support not compiled in"));
         assert!(text.contains("server.log"));
+    }
+
+    #[test]
+    fn spawn_command_includes_config() {
+        assert_eq!(server_args(None), vec![std::ffi::OsString::from("serve")]);
+        assert_eq!(
+            server_args(Some(Path::new("/a/b.toml"))),
+            vec![
+                std::ffi::OsString::from("serve"),
+                std::ffi::OsString::from("--config"),
+                std::ffi::OsString::from("/a/b.toml"),
+            ]
+        );
     }
 
     #[test]
@@ -785,7 +813,7 @@ mod tests {
             })
             .unwrap();
 
-        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false));
+        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false, None));
         upstream
             .forward(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_list","arguments":{}}}"#
@@ -817,7 +845,7 @@ mod tests {
             })
             .unwrap();
 
-        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false));
+        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false, None));
         let outcome = handle_line(
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"Forwarded","content":"body","tags":[]}}}"#
                 .to_string(),
@@ -850,7 +878,7 @@ mod tests {
             })
             .unwrap();
 
-        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false));
+        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false, None));
         upstream
             .ensure()
             .await

@@ -98,7 +98,7 @@ impl Singleton {
     /// without cleanup (crash, SIGKILL, reboot).
     pub fn read_live_state(state_dir: &Path) -> Option<ServerState> {
         let file = fs::File::open(state_dir.join("brain-mcp.state")).ok()?;
-        if file.try_lock_shared().is_ok() {
+        if fs2::FileExt::try_lock_shared(&file).is_ok() {
             return None;
         }
         Self::read_state(state_dir)

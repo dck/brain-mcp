@@ -1,5 +1,10 @@
 # brain-mcp — Project Specification v1
 
+> **Historical document.** This is the original v1 specification. Several parts were never built or were replaced:
+> the libsql and sqlite-vec index backends (the index is plain SQLite with vectors as BLOBs), HTTP/SSE and Unix-socket
+> transports (clients use the `serve --stdio` proxy), the filesystem watcher, `serve --daemonize`, and connection
+> reference counting (replaced by session leases). README.md and CLAUDE.md describe the current system.
+
 > MCP server that gives AI coding agents persistent, cross-project memory backed by an Obsidian-compatible markdown vault with semantic vector search.
 
 ## Problem

@@ -36,6 +36,21 @@ pub struct IndexConfig {
     pub path: String,
 }
 
+pub const SUPPORTED_INDEX_BACKENDS: &[&str] = &["sqlite", "sqlite-vec"];
+
+impl IndexConfig {
+    pub fn validate_backend(&self) -> Result<(), String> {
+        if SUPPORTED_INDEX_BACKENDS.contains(&self.backend.as_str()) {
+            Ok(())
+        } else {
+            Err(format!(
+                "unsupported index backend \"{}\" in config; supported: \"sqlite\"",
+                self.backend
+            ))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchConfig {
     #[serde(default = "default_min_score")]
@@ -97,7 +112,7 @@ pub fn default_categories() -> Vec<String> {
 }
 
 fn default_backend() -> String {
-    "sqlite-vec".into()
+    "sqlite".into()
 }
 
 fn default_min_score() -> f32 {
@@ -130,7 +145,7 @@ mod tests {
             config.embedding.api_key_env.as_deref(),
             Some("OPENAI_API_KEY")
         );
-        assert_eq!(config.index.backend, "sqlite-vec");
+        assert_eq!(config.index.backend, "sqlite");
         assert_eq!(config.index.path, "~/.config/brain-mcp/index.db");
         assert_eq!(config.server.http_port, 47200);
         assert_eq!(config.server.grace_period_seconds, 60);
@@ -145,5 +160,51 @@ mod tests {
 
         assert!(!resolved.vault.path.starts_with('~'));
         assert!(!resolved.index.path.starts_with('~'));
+    }
+
+    #[test]
+    fn legacy_backend_label_is_accepted() {
+        let index = IndexConfig {
+            backend: "sqlite-vec".into(),
+            path: "x".into(),
+        };
+        assert!(index.validate_backend().is_ok());
+    }
+
+    #[test]
+    fn unknown_backend_is_rejected() {
+        let index = IndexConfig {
+            backend: "libsql".into(),
+            path: "x".into(),
+        };
+        let err = index.validate_backend().unwrap_err();
+        assert!(err.contains("unsupported index backend \"libsql\""));
+    }
+
+    #[test]
+    fn missing_backend_defaults_to_sqlite() {
+        let raw = r#"
+[vault]
+path = "~/brain"
+templates_dir = "_templates"
+categories = ["procedures", "decisions", "learnings", "concepts", "projects"]
+
+[embedding]
+provider = "openai"
+model = "text-embedding-3-small"
+api_key_env = "OPENAI_API_KEY"
+
+[index]
+path = "~/.config/brain-mcp/index.db"
+
+[server]
+http_port = 47200
+grace_period_seconds = 60
+
+[search]
+min_score = 0.25
+"#;
+        let config: Config = toml::from_str(raw).expect("should deserialize without backend");
+        assert_eq!(config.index.backend, "sqlite");
     }
 }

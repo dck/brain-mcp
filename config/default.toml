@@ -9,7 +9,7 @@ model = "text-embedding-3-small"
 api_key_env = "OPENAI_API_KEY"
 
 [index]
-backend = "sqlite-vec"
+backend = "sqlite"
 path = "~/.config/brain-mcp/index.db"
 
 [server]

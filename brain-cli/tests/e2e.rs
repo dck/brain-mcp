@@ -54,7 +54,7 @@ async fn full_roundtrip() {
         "_templates".into(),
     ));
     let embedder = Arc::new(brain_core::mocks::MockEmbedder::new(8));
-    let index = Arc::new(brain_index::adapter::SqliteVecIndex::open_in_memory(8).unwrap());
+    let index = Arc::new(brain_index::adapter::SqliteVecIndex::open_in_memory().unwrap());
     let service = Arc::new(brain_core::service::MemoryService::new(
         vault, embedder, index,
     ));

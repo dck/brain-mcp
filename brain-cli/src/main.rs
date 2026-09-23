@@ -1,6 +1,9 @@
 mod commands;
 mod output;
 
+#[cfg(not(unix))]
+compile_error!("brain-mcp supports macOS and Linux only");
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -29,9 +32,6 @@ enum Commands {
     Init,
     /// Start the memory server
     Serve {
-        /// Run in background
-        #[arg(long)]
-        daemonize: bool,
         /// Run as stdio bridge (for MCP command transport)
         #[arg(long)]
         stdio: bool,
@@ -57,7 +57,7 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let default_filter = match &cli.command {
-        Commands::Serve { stdio: false, .. } => "info",
+        Commands::Serve { stdio: false } => "info",
         _ => "warn",
     };
     tracing_subscriber::fmt()
@@ -71,9 +71,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Init => commands::init::run(cli.json).await,
-        Commands::Serve { daemonize, stdio } => {
-            commands::serve::run(cli.config, daemonize, stdio).await
-        }
+        Commands::Serve { stdio } => commands::serve::run(cli.config, stdio).await,
         Commands::Recall { project, limit } => {
             commands::recall::run(cli.config, project, limit).await
         }

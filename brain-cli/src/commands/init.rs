@@ -251,7 +251,7 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
             model_path,
         },
         index: IndexConfig {
-            backend: "sqlite-vec".into(),
+            backend: "sqlite".into(),
             path: "~/.config/brain-mcp/index.db".into(),
         },
         server: ServerConfig {

@@ -88,6 +88,10 @@ async fn reindex_via_server(state: &ServerState, json_output: bool) -> anyhow::R
 
 async fn reindex_local(config_path: Option<PathBuf>, json_output: bool) -> anyhow::Result<()> {
     let config = load_config(config_path)?;
+    config
+        .index
+        .validate_backend()
+        .map_err(anyhow::Error::msg)?;
 
     let spinner = if !json_output {
         let sp = ProgressBar::new_spinner();
@@ -107,7 +111,7 @@ async fn reindex_local(config_path: Option<PathBuf>, json_output: bool) -> anyho
     if let Some(parent) = index_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let index = Arc::new(SqliteVecIndex::open(&index_path, embedder.dimensions())?);
+    let index = Arc::new(SqliteVecIndex::open(&index_path)?);
 
     let service =
         MemoryService::new(vault, embedder, index).with_categories(config.vault.categories.clone());

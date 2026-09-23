@@ -1,5 +1,7 @@
 # brain-mcp
 
+[![CI](https://github.com/dck/brain-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/dck/brain-mcp/actions/workflows/ci.yml)
+
 MCP server that gives AI coding agents persistent, cross-project memory backed by an Obsidian-compatible markdown vault with semantic vector search.
 
 ## Why
@@ -23,6 +25,8 @@ Claude Code Session 3 ──┘        (one per session)       (singleton)
 - **Obsidian vault**: memories are markdown files with YAML frontmatter — browse them in Obsidian
 - **Semantic search**: queries are embedded and matched against stored memories using cosine similarity
 
+The stdio bridge answers the MCP handshake itself, so Claude Code connects instantly even while the server is starting or broken. Tool calls then report the server's startup error instead of timing out. The server listens on loopback only and requires a per-start token that only your user can read. It exits about a minute after the last session closes. The next session starts it again.
+
 ## MCP tools
 
 | Tool | Description |
@@ -39,6 +43,7 @@ Claude Code Session 3 ──┘        (one per session)       (singleton)
 ### Prerequisites
 
 - Rust toolchain (edition 2024, Rust 1.88+)
+- macOS or Linux (Windows is not supported)
 - Network access on the first build: the ONNX Runtime binaries are downloaded by the `ort` crate
 - For OpenAI embeddings: an API key
 
@@ -71,6 +76,8 @@ If you choose local ONNX, the model (~90MB) is downloaded automatically.
 ```bash
 claude mcp add --scope user --transport stdio brain-mcp -- brain-mcp serve --stdio
 ```
+
+To use a non-default config, register `brain-mcp --config /path/to/config.toml serve --stdio`. Only one server runs per user: `--config` applies when the proxy has to start the server, and it does not switch a server that is already running.
 
 Restart Claude Code. The server starts automatically when Claude Code connects.
 
@@ -106,11 +113,11 @@ Hexagonal (ports & adapters). The core domain has no knowledge of transport, sto
 
 ```
 brain-cli (binary, wires everything)
-  -> brain-server (axum HTTP, singleton lifecycle, client tracking)
+  -> brain-server (axum HTTP, bearer auth, singleton, session leases)
        -> brain-mcp-proto (JSON-RPC 2.0, tool schemas, handler routing)
             -> brain-core (domain: MemoryService, port traits, models, config)
   -> brain-vault (VaultPort: markdown files + YAML frontmatter)
-  -> brain-embed (EmbeddingPort: OpenAI API or local ONNX)
+  -> brain-embed (EmbeddingPort: local ONNX (default feature) or OpenAI API)
   -> brain-index (IndexPort: rusqlite + cosine similarity)
 ```
 
@@ -174,6 +181,17 @@ http_port = 47200
 grace_period_seconds = 60
 ```
 
+Older configs may contain `backend = "sqlite-vec"`; it is still accepted and means the built-in SQLite index.
+
+## Troubleshooting
+
+- `brain-mcp status` shows the server PID, version, live sessions and the log path.
+- A server started by Claude Code logs to `server.log` in the state directory
+  (`~/Library/Application Support/brain-mcp/run/` on macOS, `~/.config/brain-mcp/run/` on Linux).
+  If a tool call reports "brain-mcp server is unavailable", the message quotes the end of that log.
+- `brain-mcp stop` shuts the server down; the next tool call starts a fresh one.
+- Set `grace_period_seconds = 0` under `[server]` to keep the server running when no session is open.
+
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).

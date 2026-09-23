@@ -20,17 +20,17 @@ use brain_vault::VaultAdapter;
 use super::{load_config, state_dir};
 use crate::output;
 
-pub async fn run(
-    config_path: Option<PathBuf>,
-    _daemonize: bool,
-    stdio: bool,
-) -> anyhow::Result<()> {
+pub async fn run(config_path: Option<PathBuf>, stdio: bool) -> anyhow::Result<()> {
     if stdio {
         return run_stdio(config_path).await;
     }
 
     // 1. Load config
     let config = load_config(config_path)?;
+    config
+        .index
+        .validate_backend()
+        .map_err(anyhow::Error::msg)?;
 
     // 2. Build adapters
     let vault = Arc::new(VaultAdapter::new(
@@ -44,7 +44,7 @@ pub async fn run(
     if let Some(parent) = index_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let index = Arc::new(SqliteVecIndex::open(&index_path, embedder.dimensions())?);
+    let index = Arc::new(SqliteVecIndex::open(&index_path)?);
 
     // 3. Build service
     let service = Arc::new(
@@ -162,6 +162,7 @@ pub async fn run(
     Ok(())
 }
 
-async fn run_stdio(_config_path: Option<PathBuf>) -> anyhow::Result<()> {
-    super::proxy::run(state_dir()).await
+async fn run_stdio(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    let config_path = config_path.map(std::path::absolute).transpose()?;
+    super::proxy::run(state_dir(), config_path).await
 }

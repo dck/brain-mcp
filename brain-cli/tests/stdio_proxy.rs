@@ -198,6 +198,107 @@ fn legacy_state_file_without_lock_is_ignored() {
     assert_eq!(status, Some(0));
 }
 
+#[test]
+fn config_flag_reaches_spawned_server() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let warmup = std::process::Command::new(env!("CARGO_BIN_EXE_brain-mcp"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(warmup.status.success());
+
+    let config_path = tmp.path().join("custom.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"[vault]
+path = "{vault}"
+
+[embedding]
+provider = "nonexistent"
+model = "test-model"
+
+[index]
+path = "{index}"
+
+[server]
+"#,
+            vault = tmp.path().join("vault").display(),
+            index = tmp.path().join("index.db").display(),
+        ),
+    )
+    .unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_brain-mcp"))
+        .args(["--config"])
+        .arg(&config_path)
+        .args(["serve", "--stdio"])
+        .env("HOME", tmp.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+
+    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    if line_tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let send = |stdin: &mut std::process::ChildStdin, line: &str| {
+        stdin.write_all(line.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.flush().unwrap();
+    };
+
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}"#,
+    );
+    let line = line_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("initialize response within 1s");
+    let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(resp["result"]["serverInfo"]["name"], "brain-mcp");
+
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    );
+
+    send(
+        &mut stdin,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_list","arguments":{}}}"#,
+    );
+    let line = line_rx
+        .recv_timeout(Duration::from_secs(12))
+        .expect("tools/call response within 12s");
+    let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("unknown embedding provider: nonexistent"));
+
+    drop(stdin);
+    let status = child.wait_timeout_or_kill(Duration::from_secs(5));
+    assert_eq!(status, Some(0));
+}
+
 trait WaitTimeoutOrKill {
     fn wait_timeout_or_kill(&mut self, timeout: Duration) -> Option<i32>;
 }

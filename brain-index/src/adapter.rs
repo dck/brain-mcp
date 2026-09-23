@@ -13,24 +13,20 @@ use brain_core::ports::{BoxFuture, IndexPort};
 
 pub struct SqliteVecIndex {
     conn: Mutex<Connection>,
-    #[allow(dead_code)]
-    dims: usize,
 }
 
 impl SqliteVecIndex {
-    pub fn open(path: &Path, dims: usize) -> anyhow::Result<Self> {
+    pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = prepare_connection(Connection::open(path)?, &path.display().to_string())?;
         Ok(Self {
             conn: Mutex::new(conn),
-            dims,
         })
     }
 
-    pub fn open_in_memory(dims: usize) -> anyhow::Result<Self> {
+    pub fn open_in_memory() -> anyhow::Result<Self> {
         let conn = prepare_connection(Connection::open_in_memory()?, ":memory:")?;
         Ok(Self {
             conn: Mutex::new(conn),
-            dims,
         })
     }
 }
@@ -437,7 +433,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_creates_schema() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
         let conn = index.conn.lock().await;
         let tables: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
@@ -453,7 +449,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upsert_and_search() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
         let meta = make_metadata("m1", "learnings", vec!["rust"], None);
         let vec = vec![1.0, 0.0, 0.0];
         index.upsert("m1", &vec, &meta).await.unwrap();
@@ -466,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_ranking() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
 
         let m1 = make_metadata("m1", "learnings", vec![], None);
         let m2 = make_metadata("m2", "learnings", vec![], None);
@@ -489,7 +485,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_with_category_filter() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
 
         let m1 = make_metadata("m1", "learnings", vec![], None);
         let m2 = make_metadata("m2", "decisions", vec![], None);
@@ -508,7 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_all() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
 
         for i in 1..=3 {
             let id = format!("m{i}");
@@ -522,7 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_with_tag_filter() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
 
         let m1 = make_metadata("m1", "learnings", vec!["rust", "async"], None);
         let m2 = make_metadata("m2", "learnings", vec!["python"], None);
@@ -545,7 +541,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
 
         let meta = make_metadata("m1", "learnings", vec![], None);
         index.upsert("m1", &[1.0, 0.0, 0.0], &meta).await.unwrap();
@@ -563,7 +559,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_recency_breaks_ties() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
 
         let mut old = make_metadata("old", "learnings", vec![], None);
         old.created_at = Utc::now() - chrono::Duration::days(365);
@@ -586,7 +582,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_access_increments() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
         let meta = make_metadata("m1", "learnings", vec![], None);
         index.upsert("m1", &[1.0, 0.0, 0.0], &meta).await.unwrap();
 
@@ -607,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upsert_preserves_access_count() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
         let meta = make_metadata("m1", "learnings", vec![], None);
         index.upsert("m1", &[1.0, 0.0, 0.0], &meta).await.unwrap();
         index.record_access(&["m1".to_string()]).await.unwrap();
@@ -627,7 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_model_id_tracking() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
         index.set_model_id("text-embedding-3-small").await.unwrap();
         let stored = index.stored_model_id().await.unwrap();
         assert_eq!(stored, Some("text-embedding-3-small".to_string()));
@@ -635,14 +631,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_model_id_initially_none() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
         let stored = index.stored_model_id().await.unwrap();
         assert_eq!(stored, None);
     }
 
     #[tokio::test]
     async fn test_fresh_db_is_at_latest_version() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
         let conn = index.conn.lock().await;
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -653,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn test_file_db_uses_wal() {
         let dir = tempfile::tempdir().unwrap();
-        let index = SqliteVecIndex::open(&dir.path().join("index.db"), 3).unwrap();
+        let index = SqliteVecIndex::open(&dir.path().join("index.db")).unwrap();
         let conn = index.conn.lock().await;
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
@@ -695,7 +691,7 @@ mod tests {
             .unwrap();
         }
 
-        let index = SqliteVecIndex::open(&path, 3).unwrap();
+        let index = SqliteVecIndex::open(&path).unwrap();
         {
             let conn = index.conn.lock().await;
             let version: i64 = conn
@@ -732,7 +728,7 @@ mod tests {
             .unwrap();
         }
 
-        let index = SqliteVecIndex::open(&path, 3).unwrap();
+        let index = SqliteVecIndex::open(&path).unwrap();
         let conn = index.conn.lock().await;
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -754,12 +750,12 @@ mod tests {
         let path = dir.path().join("index.db");
 
         {
-            let index = SqliteVecIndex::open(&path, 3).unwrap();
+            let index = SqliteVecIndex::open(&path).unwrap();
             let meta = make_metadata("m1", "learnings", vec![], None);
             index.upsert("m1", &[1.0, 0.0, 0.0], &meta).await.unwrap();
         }
 
-        let index = SqliteVecIndex::open(&path, 3).unwrap();
+        let index = SqliteVecIndex::open(&path).unwrap();
         let conn = index.conn.lock().await;
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -779,7 +775,7 @@ mod tests {
             conn.execute_batch("PRAGMA user_version = 99;").unwrap();
         }
 
-        match SqliteVecIndex::open(&path, 3) {
+        match SqliteVecIndex::open(&path) {
             Ok(_) => panic!("expected an error"),
             Err(e) => assert!(e.to_string().contains("newer than this brain-mcp supports")),
         }
@@ -787,7 +783,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rebuild_preserves_access_stats() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
         let m1 = make_metadata("m1", "learnings", vec![], None);
         let m2 = make_metadata("m2", "learnings", vec![], None);
         index.upsert("m1", &[1.0, 0.0, 0.0], &m1).await.unwrap();
@@ -863,7 +859,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rebuild_empty_entries_empties_index() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
         for i in 1..=3 {
             let id = format!("m{i}");
             let meta = make_metadata(&id, "learnings", vec![], None);
@@ -885,7 +881,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rebuild_removes_orphan_vectors() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
         {
             let conn = index.conn.lock().await;
             conn.execute(
@@ -906,7 +902,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bad_created_at_row_is_skipped() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
         let m1 = make_metadata("m1", "learnings", vec![], None);
         index.upsert("m1", &[1.0, 0.0, 0.0], &m1).await.unwrap();
         {
@@ -934,7 +930,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_access_unknown_id_is_noop() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let index = SqliteVecIndex::open_in_memory().unwrap();
         index.record_access(&["nope".to_string()]).await.unwrap();
     }
 }
