@@ -2,17 +2,21 @@ use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use brain_mcp_proto::jsonrpc::{INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR, Request, Response};
-use brain_mcp_proto::mcp::{initialize_result, tool_error};
+use brain_mcp_proto::mcp::{SERVER_VERSION, initialize_result, tool_error};
 use brain_mcp_proto::schema::tool_definitions;
-use brain_server::singleton::Singleton;
+use brain_server::identity::{ServerIdentity, current_exe_path, parse_version};
+use brain_server::singleton::{ServerState, Singleton};
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
+use super::server_client::{self, IdentityError};
+
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
-const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(2);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 const REINDEX_TIMEOUT: Duration = Duration::from_secs(600);
 const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
@@ -33,6 +37,9 @@ enum UpstreamError {
         timeout: Duration,
     },
     Status(u16, String),
+    Hung {
+        timeout: Duration,
+    },
 }
 
 impl std::fmt::Display for UpstreamError {
@@ -60,6 +67,11 @@ impl std::fmt::Display for UpstreamError {
                 let truncated: String = body.chars().take(200).collect();
                 write!(f, "server returned HTTP {code}: {truncated}")
             }
+            UpstreamError::Hung { timeout } => write!(
+                f,
+                "request timed out after {}s; the server was unresponsive and has been stopped; retry the call to start a fresh one",
+                timeout.as_secs()
+            ),
         }
     }
 }
@@ -67,36 +79,45 @@ impl std::fmt::Display for UpstreamError {
 struct Upstream {
     state_dir: PathBuf,
     client: reqwest::Client,
-    url: tokio::sync::Mutex<Option<String>>,
+    conn: tokio::sync::Mutex<Option<ServerState>>,
     spawn_enabled: bool,
+    consecutive_timeouts: AtomicU32,
 }
 
 impl Upstream {
     fn new(state_dir: PathBuf, spawn_enabled: bool) -> Self {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .expect("reqwest client without proxy never fails to build");
         Self {
             state_dir,
-            client,
-            url: tokio::sync::Mutex::new(None),
+            client: server_client::loopback_client(),
+            conn: tokio::sync::Mutex::new(None),
             spawn_enabled,
+            consecutive_timeouts: AtomicU32::new(0),
         }
     }
 
-    async fn ensure(&self) -> Result<String, UpstreamError> {
-        let mut guard = self.url.lock().await;
-        if let Some(url) = guard.as_ref() {
-            return Ok(url.clone());
+    async fn ensure(&self) -> Result<ServerState, UpstreamError> {
+        let mut guard = self.conn.lock().await;
+        if let Some(state) = guard.as_ref() {
+            return Ok(state.clone());
         }
 
-        if let Some(state) = Singleton::read_live_state(&self.state_dir)
-            && self.probe(&state.http).await
-        {
-            *guard = Some(state.http.clone());
-            return Ok(state.http);
+        if let Some(state) = Singleton::read_live_state(&self.state_dir) {
+            if state.token.is_empty() {
+                self.kill_server(state.pid).await;
+            } else {
+                match self.identify(&state).await {
+                    Ok(id) => {
+                        let own = OwnBuild::current();
+                        if needs_restart(&own, &state, &id) {
+                            self.retire(&state).await;
+                        } else {
+                            *guard = Some(state.clone());
+                            return Ok(state);
+                        }
+                    }
+                    Err(_) => self.kill_server(state.pid).await,
+                }
+            }
         }
 
         if !self.spawn_enabled {
@@ -104,55 +125,92 @@ impl Upstream {
         }
 
         let mut child = spawn_server(&self.state_dir).map_err(UpstreamError::Spawn)?;
-        let url = self.wait_for_server(&mut child).await?;
-        *guard = Some(url.clone());
-        Ok(url)
+        let state = self.wait_for_server(&mut child).await?;
+        *guard = Some(state.clone());
+        Ok(state)
     }
 
-    async fn probe(&self, url: &str) -> bool {
-        let resp = match self
-            .client
-            .post(url)
-            .header("Content-Type", "application/json")
-            .json(&json!({"jsonrpc": "2.0", "id": 0, "method": "ping"}))
-            .timeout(PROBE_TIMEOUT)
-            .send()
-            .await
-        {
-            Ok(resp) => resp,
-            Err(_) => return false,
-        };
-        if resp.status() != reqwest::StatusCode::OK {
-            return false;
+    async fn identify(&self, state: &ServerState) -> Result<ServerIdentity, IdentityError> {
+        match server_client::fetch_identity(&self.client, state, IDENTIFY_TIMEOUT).await {
+            Err(IdentityError::Unreachable) => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                server_client::fetch_identity(&self.client, state, IDENTIFY_TIMEOUT).await
+            }
+            other => other,
         }
-        let body: Value = match resp.json().await {
-            Ok(body) => body,
-            Err(_) => return false,
-        };
-        body.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
-            && (body.get("result").is_some() || body.get("error").is_some())
+    }
+
+    async fn retire(&self, state: &ServerState) {
+        if !self.spawn_enabled {
+            eprintln!(
+                "brain-mcp proxy: not restarting server (PID {}); spawning disabled",
+                state.pid
+            );
+            return;
+        }
+        server_client::request_shutdown(&self.client, state).await;
+        if server_client::wait_released(&self.state_dir, state.pid, Duration::from_secs(5)).await {
+            return;
+        }
+        self.kill_server(state.pid).await;
+    }
+
+    async fn kill_server(&self, pid: u32) {
+        if !self.spawn_enabled {
+            eprintln!("brain-mcp proxy: not stopping server (PID {pid}); spawning disabled");
+            return;
+        }
+        if pid <= 1 || pid == std::process::id() {
+            return;
+        }
+        eprintln!("brain-mcp proxy: stopping unresponsive server (PID {pid})");
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if server_client::wait_released(&self.state_dir, pid, Duration::from_secs(3)).await {
+            return;
+        }
+        eprintln!("brain-mcp proxy: stopping unresponsive server (PID {pid}) ... sending SIGKILL");
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        server_client::wait_released(&self.state_dir, pid, Duration::from_secs(2)).await;
     }
 
     async fn invalidate(&self) {
-        let mut guard = self.url.lock().await;
+        let mut guard = self.conn.lock().await;
         *guard = None;
     }
 
     async fn post(
         &self,
-        url: &str,
+        state: &ServerState,
         body: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, UpstreamError> {
         let resp = self
             .client
-            .post(url)
+            .post(&state.http)
             .header("Content-Type", "application/json")
+            .bearer_auth(&state.token)
             .body(body.to_vec())
             .timeout(timeout)
             .send()
-            .await
-            .map_err(|error| UpstreamError::Request { error, timeout })?;
+            .await;
+
+        let resp = match resp {
+            Ok(resp) => {
+                self.consecutive_timeouts.store(0, Ordering::SeqCst);
+                resp
+            }
+            Err(error) if error.is_timeout() => {
+                let n = self.consecutive_timeouts.fetch_add(1, Ordering::SeqCst) + 1;
+                if n >= 2 {
+                    self.kill_server(state.pid).await;
+                    self.invalidate().await;
+                    self.consecutive_timeouts.store(0, Ordering::SeqCst);
+                    return Err(UpstreamError::Hung { timeout });
+                }
+                return Err(UpstreamError::Request { error, timeout });
+            }
+            Err(error) => return Err(UpstreamError::Request { error, timeout }),
+        };
 
         let status = resp.status();
         if status != reqwest::StatusCode::OK {
@@ -168,30 +226,35 @@ impl Upstream {
     }
 
     async fn forward(&self, body: String, timeout: Duration) -> Result<Vec<u8>, UpstreamError> {
-        let url = self.ensure().await?;
-        match self.post(&url, body.as_bytes(), timeout).await {
+        let state = self.ensure().await?;
+        match self.post(&state, body.as_bytes(), timeout).await {
             Err(UpstreamError::Request { error, .. }) if error.is_connect() => {
                 self.invalidate().await;
-                let url = self.ensure().await?;
-                self.post(&url, body.as_bytes(), timeout).await
+                let state = self.ensure().await?;
+                self.post(&state, body.as_bytes(), timeout).await
+            }
+            Err(UpstreamError::Status(401, _)) => {
+                self.invalidate().await;
+                let state = self.ensure().await?;
+                self.post(&state, body.as_bytes(), timeout).await
             }
             other => other,
         }
     }
 
-    async fn wait_for_server(&self, child: &mut Child) -> Result<String, UpstreamError> {
+    async fn wait_for_server(&self, child: &mut Child) -> Result<ServerState, UpstreamError> {
         let start = Instant::now();
         loop {
             if let Some(state) = Singleton::read_live_state(&self.state_dir)
-                && self.probe(&state.http).await
+                && self.identify(&state).await.is_ok()
             {
-                return Ok(state.http);
+                return Ok(state);
             }
             if let Some(status) = child.try_wait().map_err(UpstreamError::Spawn)? {
                 if let Some(state) = Singleton::read_live_state(&self.state_dir)
-                    && self.probe(&state.http).await
+                    && self.identify(&state).await.is_ok()
                 {
-                    return Ok(state.http);
+                    return Ok(state);
                 }
                 if !status.success() {
                     return Err(UpstreamError::Exited(status));
@@ -203,6 +266,45 @@ impl Upstream {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+}
+
+struct OwnBuild {
+    exe: Option<PathBuf>,
+    mtime: Option<DateTime<Utc>>,
+    version: &'static str,
+}
+
+impl OwnBuild {
+    fn current() -> Self {
+        let exe = current_exe_path();
+        let mtime = exe
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok())
+            .map(DateTime::<Utc>::from);
+        Self {
+            exe,
+            mtime,
+            version: SERVER_VERSION,
+        }
+    }
+}
+
+fn needs_restart(own: &OwnBuild, state: &ServerState, id: &ServerIdentity) -> bool {
+    if state.token.is_empty() {
+        return true;
+    }
+    let same_exe = own
+        .exe
+        .as_ref()
+        .is_some_and(|e| e.to_string_lossy() == id.exe);
+    if same_exe && own.mtime.is_some_and(|m| m > id.started_at) {
+        return true;
+    }
+    matches!(
+        (parse_version(&id.version), parse_version(own.version)),
+        (Some(theirs), Some(ours)) if theirs < ours
+    )
 }
 
 fn spawn_server(state_dir: &Path) -> std::io::Result<std::process::Child> {
@@ -222,7 +324,8 @@ fn spawn_server(state_dir: &Path) -> std::io::Result<std::process::Child> {
         std::process::id(),
         chrono::Utc::now().to_rfc3339()
     )?;
-    let exe = std::env::current_exe()?;
+    let exe = current_exe_path()
+        .ok_or_else(|| std::io::Error::other("cannot resolve current executable"))?;
     unsafe {
         std::process::Command::new(exe)
             .arg("serve")
@@ -549,10 +652,7 @@ mod tests {
         assert_eq!(lines[9], "line49");
     }
 
-    #[tokio::test]
-    async fn forward_to_live_server() {
-        let dir = tempfile::tempdir().unwrap();
-
+    async fn start_test_server(token: String) -> (u16, tokio::sync::watch::Sender<bool>) {
         let vault = Arc::new(brain_core::mocks::MockVault::new());
         let embedder = Arc::new(brain_core::mocks::MockEmbedder::new(8));
         let index = Arc::new(brain_core::mocks::MockIndex::new());
@@ -560,17 +660,27 @@ mod tests {
             vault, embedder, index,
         ));
         let handler = Arc::new(brain_mcp_proto::handler::McpHandler::new(service));
-        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let port = brain_server::http::run_on_random_port(handler, shutdown_rx)
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let port = brain_server::http::run_on_random_port(handler, token, shutdown_tx.clone())
             .await
             .unwrap();
+        (port, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn forward_to_live_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = brain_server::auth::generate_token();
+        let (port, _shutdown_tx) = start_test_server(token.clone()).await;
 
         let singleton = Singleton::acquire(dir.path()).unwrap();
         singleton
-            .write_state(&brain_server::singleton::ServerState {
+            .write_state(&ServerState {
                 pid: std::process::id(),
                 http: format!("http://127.0.0.1:{port}/mcp"),
                 started_at: chrono::Utc::now(),
+                version: SERVER_VERSION.to_string(),
+                token: token.clone(),
             })
             .unwrap();
 
@@ -587,5 +697,94 @@ mod tests {
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let memory: Value = serde_json::from_str(text).unwrap();
         assert_eq!(memory["title"], "Forwarded");
+    }
+
+    #[tokio::test]
+    async fn stale_token_is_refreshed() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_a = brain_server::auth::generate_token();
+        let (port, _shutdown_tx) = start_test_server(token_a.clone()).await;
+
+        let singleton = Singleton::acquire(dir.path()).unwrap();
+        let token_b = brain_server::auth::generate_token();
+        singleton
+            .write_state(&ServerState {
+                pid: std::process::id(),
+                http: format!("http://127.0.0.1:{port}/mcp"),
+                started_at: chrono::Utc::now(),
+                version: SERVER_VERSION.to_string(),
+                token: token_b,
+            })
+            .unwrap();
+
+        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false));
+        upstream
+            .ensure()
+            .await
+            .expect("ensure succeeds via /health");
+
+        singleton
+            .write_state(&ServerState {
+                pid: std::process::id(),
+                http: format!("http://127.0.0.1:{port}/mcp"),
+                started_at: chrono::Utc::now(),
+                version: SERVER_VERSION.to_string(),
+                token: token_a,
+            })
+            .unwrap();
+
+        let outcome = handle_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_list","arguments":{}}}"#
+                .to_string(),
+            upstream,
+        )
+        .await;
+        let resp = value_of(outcome);
+        assert!(resp["error"].is_null());
+        assert!(resp["result"]["isError"].is_null());
+    }
+
+    #[test]
+    fn needs_restart_matrix() {
+        let mut state = ServerState {
+            pid: 100,
+            http: "http://127.0.0.1:1/mcp".into(),
+            started_at: Utc::now(),
+            version: "0.1.0".into(),
+            token: "t".into(),
+        };
+        let mut identity = ServerIdentity {
+            name: "brain-mcp".into(),
+            version: "0.1.0".into(),
+            pid: 100,
+            started_at: Utc::now(),
+            exe: "/other/brain-mcp".into(),
+        };
+        let own = OwnBuild {
+            exe: Some(PathBuf::from("/own/brain-mcp")),
+            mtime: Some(Utc::now()),
+            version: "0.1.0",
+        };
+
+        state.token = String::new();
+        assert!(needs_restart(&own, &state, &identity));
+        state.token = "t".into();
+
+        identity.exe = "/own/brain-mcp".into();
+        identity.started_at = Utc::now() - chrono::Duration::seconds(10);
+        assert!(needs_restart(&own, &state, &identity));
+
+        identity.started_at = Utc::now() + chrono::Duration::seconds(10);
+        assert!(!needs_restart(&own, &state, &identity));
+
+        identity.exe = "/other/brain-mcp".into();
+        identity.version = "0.0.9".into();
+        assert!(needs_restart(&own, &state, &identity));
+
+        identity.version = "0.2.0".into();
+        assert!(!needs_restart(&own, &state, &identity));
+
+        identity.version = "0.1.0".into();
+        assert!(!needs_restart(&own, &state, &identity));
     }
 }

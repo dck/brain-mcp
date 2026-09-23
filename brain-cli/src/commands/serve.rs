@@ -9,7 +9,9 @@ use brain_core::service::MemoryService;
 use brain_embed::create_embedder;
 use brain_index::adapter::SqliteVecIndex;
 use brain_mcp_proto::handler::McpHandler;
-use brain_server::http::HttpServer;
+use brain_server::auth::generate_token;
+use brain_server::http::{HttpServer, bind_loopback};
+use brain_server::identity::ServerIdentity;
 use brain_server::singleton::{ServerState, Singleton, SingletonError};
 use brain_vault::VaultAdapter;
 
@@ -73,20 +75,38 @@ pub async fn run(
             );
             std::process::exit(0);
         }
+        Err(SingletonError::Starting) => {
+            eprintln!("  Another brain-mcp server is starting");
+            std::process::exit(0);
+        }
         Err(e) => return Err(e.into()),
     };
 
     // 6. Shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    drop(shutdown_rx);
 
-    // 7. Write server state
-    let url = format!("http://127.0.0.1:{}/mcp", config.server.http_port);
-    let state = ServerState {
+    // 7. Bind the listener before writing state, so the state file never
+    // outlives a port that failed to bind.
+    let listener = bind_loopback(config.server.http_port).await?;
+    let port = listener.local_addr()?.port();
+    if port != config.server.http_port {
+        eprintln!(
+            "  Port {} is in use; listening on a random port instead",
+            config.server.http_port
+        );
+    }
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let started_at = Utc::now();
+    let token = generate_token();
+    let identity = ServerIdentity::current(started_at);
+    singleton.write_state(&ServerState {
         pid: std::process::id(),
         http: url.clone(),
-        started_at: Utc::now(),
-    };
-    singleton.write_state(&state)?;
+        started_at,
+        version: identity.version.clone(),
+        token: token.clone(),
+    })?;
 
     // 8. Signal handling
     let sig_tx = shutdown_tx.clone();
@@ -97,12 +117,12 @@ pub async fn run(
 
     // 9. Build handler + server
     let handler = Arc::new(McpHandler::new(service));
-    let server = HttpServer::new(handler, config.server.http_port);
+    let server = HttpServer::new(handler, identity, token, shutdown_tx);
 
     println!("{}", output::success(&format!("Listening on {url}")));
 
     // 10. Run (blocks until shutdown)
-    server.run(shutdown_rx).await?;
+    server.serve(listener).await?;
 
     // Singleton dropped here, releasing lock + removing state file
     drop(singleton);

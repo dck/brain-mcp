@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use indicatif::ProgressBar;
 use serde_json::json;
@@ -7,9 +8,10 @@ use serde_json::json;
 use brain_core::service::MemoryService;
 use brain_embed::create_embedder;
 use brain_index::adapter::SqliteVecIndex;
-use brain_server::singleton::Singleton;
+use brain_server::singleton::{ServerState, Singleton};
 use brain_vault::VaultAdapter;
 
+use super::server_client::loopback_client;
 use super::{load_config, state_dir};
 use crate::output;
 
@@ -18,14 +20,14 @@ pub async fn run(config_path: Option<PathBuf>, json_output: bool) -> anyhow::Res
     let state = Singleton::read_live_state(&state_dir());
 
     if let Some(state) = state {
-        return reindex_via_server(&state.http, json_output).await;
+        return reindex_via_server(&state, json_output).await;
     }
 
     // No running server — do it locally.
     reindex_local(config_path, json_output).await
 }
 
-async fn reindex_via_server(base_url: &str, json_output: bool) -> anyhow::Result<()> {
+async fn reindex_via_server(state: &ServerState, json_output: bool) -> anyhow::Result<()> {
     let spinner = if !json_output {
         let sp = ProgressBar::new_spinner();
         sp.set_message("Reindexing via running server...");
@@ -35,12 +37,11 @@ async fn reindex_via_server(base_url: &str, json_output: bool) -> anyhow::Result
         None
     };
 
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("reqwest client without proxy never fails to build");
+    let client = loopback_client();
     let resp: serde_json::Value = client
-        .post(base_url)
+        .post(&state.http)
+        .bearer_auth(&state.token)
+        .timeout(Duration::from_secs(600))
         .json(&json!({
             "jsonrpc": "2.0",
             "id": 1,

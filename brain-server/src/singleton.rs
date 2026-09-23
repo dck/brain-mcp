@@ -1,16 +1,27 @@
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerState {
     pub pid: u32,
     pub http: String,
     pub started_at: DateTime<Utc>,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub token: String,
+}
+
+impl ServerState {
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{}", self.http.trim_end_matches("/mcp"), path)
+    }
 }
 
 #[derive(Debug)]
@@ -23,6 +34,8 @@ pub struct Singleton {
 pub enum SingletonError {
     #[error("Server already running")]
     AlreadyRunning(ServerState),
+    #[error("Another server is starting")]
+    Starting,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Parse error: {0}")]
@@ -35,6 +48,7 @@ impl Singleton {
     /// Returns `AlreadyRunning` if another process already holds the lock.
     pub fn acquire(state_dir: &Path) -> Result<Self, SingletonError> {
         fs::create_dir_all(state_dir)?;
+        fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700))?;
 
         let state_path = state_dir.join("brain-mcp.state");
         let lock_file = fs::OpenOptions::new()
@@ -42,7 +56,9 @@ impl Singleton {
             .write(true)
             .create(true)
             .truncate(false)
+            .mode(0o600)
             .open(&state_path)?;
+        fs::set_permissions(&state_path, fs::Permissions::from_mode(0o600))?;
 
         match lock_file.try_lock_exclusive() {
             Ok(()) => Ok(Self {
@@ -51,9 +67,10 @@ impl Singleton {
             }),
             Err(_) => {
                 // Another process holds the lock — try to read state for the error.
-                let state = Self::read_state(state_dir)
-                    .ok_or_else(|| SingletonError::Parse("locked but unreadable".into()))?;
-                Err(SingletonError::AlreadyRunning(state))
+                match Self::read_state(state_dir) {
+                    Some(state) => Err(SingletonError::AlreadyRunning(state)),
+                    None => Err(SingletonError::Starting),
+                }
             }
         }
     }
@@ -120,6 +137,8 @@ mod tests {
             pid: std::process::id(),
             http: "http://127.0.0.1:4321".into(),
             started_at: Utc::now(),
+            version: String::new(),
+            token: String::new(),
         })
         .unwrap();
 
@@ -149,6 +168,8 @@ mod tests {
             pid: std::process::id(),
             http: "http://127.0.0.1:4321".into(),
             started_at: Utc::now(),
+            version: String::new(),
+            token: String::new(),
         })
         .unwrap();
 
@@ -169,5 +190,67 @@ mod tests {
         assert!(Singleton::read_state(dir.path()).is_some());
         assert!(Singleton::read_live_state(dir.path()).is_none());
         assert!(Singleton::acquire(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn test_state_file_mode_0600() {
+        let dir = temp_dir();
+        let s1 = Singleton::acquire(dir.path()).unwrap();
+        s1.write_state(&ServerState {
+            pid: std::process::id(),
+            http: "http://127.0.0.1:4321".into(),
+            started_at: Utc::now(),
+            version: String::new(),
+            token: String::new(),
+        })
+        .unwrap();
+
+        let file_mode = fs::metadata(dir.path().join("brain-mcp.state"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(file_mode & 0o777, 0o600);
+
+        let dir_mode = fs::metadata(dir.path()).unwrap().permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn test_legacy_state_parses_without_token() {
+        let dir = temp_dir();
+        let path = dir.path().join("brain-mcp.state");
+        fs::write(
+            &path,
+            "pid = 21153\nhttp = \"http://127.0.0.1:47200/mcp\"\nstarted_at = \"2026-08-09T05:00:21Z\"\n",
+        )
+        .unwrap();
+
+        let state = Singleton::read_state(dir.path()).expect("legacy state parses");
+        assert_eq!(state.token, "");
+        assert_eq!(state.version, "");
+    }
+
+    #[test]
+    fn test_locked_but_empty_is_starting() {
+        let dir = temp_dir();
+        let _s1 = Singleton::acquire(dir.path()).unwrap();
+
+        let result = Singleton::acquire(dir.path());
+        assert!(
+            matches!(result, Err(SingletonError::Starting)),
+            "expected Starting, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_state_url() {
+        let state = ServerState {
+            pid: std::process::id(),
+            http: "http://127.0.0.1:5/mcp".into(),
+            started_at: Utc::now(),
+            version: String::new(),
+            token: String::new(),
+        };
+        assert_eq!(state.url("/health"), "http://127.0.0.1:5/health");
     }
 }

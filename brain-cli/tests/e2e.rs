@@ -5,6 +5,7 @@ use serde_json::json;
 async fn mcp_call(
     client: &reqwest::Client,
     url: &str,
+    token: &str,
     method: &str,
     params: serde_json::Value,
 ) -> serde_json::Value {
@@ -14,19 +15,27 @@ async fn mcp_call(
         "method": method,
         "params": params
     });
-    let resp = client.post(url).json(&body).send().await.unwrap();
+    let resp = client
+        .post(url)
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
     resp.json().await.unwrap()
 }
 
 async fn tool_call(
     client: &reqwest::Client,
     url: &str,
+    token: &str,
     tool: &str,
     args: serde_json::Value,
 ) -> serde_json::Value {
     mcp_call(
         client,
         url,
+        token,
         "tools/call",
         json!({
             "name": tool,
@@ -51,19 +60,20 @@ async fn full_roundtrip() {
     ));
     let handler = Arc::new(brain_mcp_proto::handler::McpHandler::new(service));
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let port = brain_server::http::run_on_random_port(handler, shutdown_rx)
+    let token = brain_server::auth::generate_token();
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+    let port = brain_server::http::run_on_random_port(handler, token.clone(), shutdown_tx.clone())
         .await
         .unwrap();
     let url = format!("http://127.0.0.1:{port}/mcp");
     let client = reqwest::Client::new();
 
     // 1. Initialize
-    let resp = mcp_call(&client, &url, "initialize", json!({})).await;
+    let resp = mcp_call(&client, &url, &token, "initialize", json!({})).await;
     assert_eq!(resp["result"]["serverInfo"]["name"], "brain-mcp");
 
     // 2. List tools
-    let resp = mcp_call(&client, &url, "tools/list", json!({})).await;
+    let resp = mcp_call(&client, &url, &token, "tools/list", json!({})).await;
     let tools = resp["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 6);
 
@@ -71,6 +81,7 @@ async fn full_roundtrip() {
     let resp = tool_call(
         &client,
         &url,
+        &token,
         "memory_store",
         json!({
             "title": "Deploy \"blue/green\" process",
@@ -89,6 +100,7 @@ async fn full_roundtrip() {
     let resp = tool_call(
         &client,
         &url,
+        &token,
         "memory_store",
         json!({
             "title": "Evil",
@@ -105,6 +117,7 @@ async fn full_roundtrip() {
     let resp = tool_call(
         &client,
         &url,
+        &token,
         "memory_search",
         json!({ "query": "deploy terraform" }),
     )
@@ -117,6 +130,7 @@ async fn full_roundtrip() {
     let resp = tool_call(
         &client,
         &url,
+        &token,
         "memory_list",
         json!({ "category": "procedures" }),
     )
@@ -129,6 +143,7 @@ async fn full_roundtrip() {
     let resp = tool_call(
         &client,
         &url,
+        &token,
         "memory_update",
         json!({
             "id": memory_id,
@@ -150,13 +165,21 @@ async fn full_roundtrip() {
     assert_eq!(parsed.title, "Updated deploy process");
 
     // 8. Delete it
-    let resp = tool_call(&client, &url, "memory_delete", json!({ "id": memory_id })).await;
+    let resp = tool_call(
+        &client,
+        &url,
+        &token,
+        "memory_delete",
+        json!({ "id": memory_id }),
+    )
+    .await;
     assert!(resp.get("error").is_none(), "delete failed: {resp}");
 
     // 9. Verify search returns empty results
     let resp = tool_call(
         &client,
         &url,
+        &token,
         "memory_search",
         json!({ "query": "deploy terraform" }),
     )
@@ -172,7 +195,7 @@ async fn full_roundtrip() {
     );
 
     // 10. Reindex (should return 0 since the memory was deleted)
-    let resp = tool_call(&client, &url, "memory_reindex", json!({})).await;
+    let resp = tool_call(&client, &url, &token, "memory_reindex", json!({})).await;
     assert!(resp.get("error").is_none(), "reindex failed: {resp}");
     let reindex_text = resp["result"]["content"][0]["text"].as_str().unwrap();
     assert!(reindex_text.contains("\"reindexed\":0"));

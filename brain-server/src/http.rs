@@ -2,42 +2,89 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::http::StatusCode;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response as HttpResponse};
-use axum::{Json, Router, extract::State, routing::post};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use brain_mcp_proto::handler::McpHandler;
 use brain_mcp_proto::jsonrpc::{INVALID_REQUEST, PARSE_ERROR, Request, Response};
+use serde_json::json;
 use tokio::sync::watch;
 
-pub struct HttpServer {
+use crate::auth;
+use crate::identity::ServerIdentity;
+
+#[derive(Clone)]
+struct AppState {
     handler: Arc<McpHandler>,
-    port: u16,
+    identity: Arc<ServerIdentity>,
+    token: Arc<str>,
+    shutdown: watch::Sender<bool>,
+}
+
+pub struct HttpServer {
+    state: AppState,
 }
 
 impl HttpServer {
-    pub fn new(handler: Arc<McpHandler>, port: u16) -> Self {
-        Self { handler, port }
+    pub fn new(
+        handler: Arc<McpHandler>,
+        identity: ServerIdentity,
+        token: String,
+        shutdown: watch::Sender<bool>,
+    ) -> Self {
+        Self {
+            state: AppState {
+                handler,
+                identity: Arc::new(identity),
+                token: Arc::from(token),
+                shutdown,
+            },
+        }
     }
 
-    pub async fn run(self, shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
-        let router = Router::new()
+    fn router(&self) -> Router {
+        Router::new()
+            .route("/health", get(handle_health))
             .route("/mcp", post(handle_mcp))
-            .with_state(self.handler);
+            .route("/shutdown", post(handle_shutdown))
+            .with_state(self.state.clone())
+    }
 
-        let addr = SocketAddr::from(([127, 0, 0, 1], self.port));
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-
+    pub async fn serve(self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+        let mut rx = self.state.shutdown.subscribe();
+        let router = self.router();
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {
-                let mut rx = shutdown;
-                let _ = rx.changed().await;
+                let _ = rx.wait_for(|v| *v).await;
             })
             .await?;
         Ok(())
     }
 }
 
-async fn handle_mcp(State(handler): State<Arc<McpHandler>>, body: Bytes) -> HttpResponse {
+pub async fn bind_loopback(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await {
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && port != 0 => {
+            tracing::warn!(port, "port in use, binding a random loopback port");
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await
+        }
+        other => other,
+    }
+}
+
+async fn handle_health(State(s): State<AppState>, headers: HeaderMap) -> HttpResponse {
+    if let Err(r) = auth::check(&headers, None) {
+        return r.into_response();
+    }
+    Json((*s.identity).clone()).into_response()
+}
+
+async fn handle_mcp(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> HttpResponse {
+    if let Err(r) = auth::check(&headers, Some(&s.token)) {
+        return r.into_response();
+    }
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -65,7 +112,16 @@ async fn handle_mcp(State(handler): State<Arc<McpHandler>>, body: Bytes) -> Http
     if is_notification {
         return StatusCode::ACCEPTED.into_response();
     }
-    Json(handler.handle(request).await).into_response()
+    Json(s.handler.handle(request).await).into_response()
+}
+
+async fn handle_shutdown(State(s): State<AppState>, headers: HeaderMap) -> HttpResponse {
+    if let Err(r) = auth::check(&headers, Some(&s.token)) {
+        return r.into_response();
+    }
+    tracing::info!("shutdown requested over HTTP");
+    let _ = s.shutdown.send(true);
+    (StatusCode::ACCEPTED, Json(json!({"shutting_down": true}))).into_response()
 }
 
 /// Start the server on a random available port.
@@ -74,30 +130,27 @@ async fn handle_mcp(State(handler): State<Arc<McpHandler>>, body: Bytes) -> Http
 /// will shut down when `shutdown` fires.
 pub async fn run_on_random_port(
     handler: Arc<McpHandler>,
-    shutdown: watch::Receiver<bool>,
+    token: String,
+    shutdown: watch::Sender<bool>,
 ) -> anyhow::Result<u16> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
-
-    let router = Router::new()
-        .route("/mcp", post(handle_mcp))
-        .with_state(handler);
-
+    let server = HttpServer::new(
+        handler,
+        ServerIdentity::current(chrono::Utc::now()),
+        token,
+        shutdown,
+    );
     tokio::spawn(async move {
-        let _ = axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                let mut rx = shutdown;
-                let _ = rx.changed().await;
-            })
-            .await;
+        let _ = server.serve(listener).await;
     });
-
     Ok(port)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::generate_token;
     use brain_core::mocks::{MockEmbedder, MockIndex, MockVault};
     use brain_core::service::MemoryService;
     use serde_json::json;
@@ -110,19 +163,23 @@ mod tests {
         Arc::new(McpHandler::new(service))
     }
 
-    async fn start_server() -> (u16, watch::Sender<bool>) {
+    async fn start_server() -> (u16, String, watch::Sender<bool>) {
         let handler = make_handler();
-        let (tx, rx) = watch::channel(false);
-        let port = run_on_random_port(handler, rx).await.unwrap();
-        (port, tx)
+        let token = generate_token();
+        let (tx, _rx) = watch::channel(false);
+        let port = run_on_random_port(handler, token.clone(), tx.clone())
+            .await
+            .unwrap();
+        (port, token, tx)
     }
 
     #[tokio::test]
     async fn test_http_handle_initialize() {
-        let (port, _tx) = start_server().await;
+        let (port, token, _tx) = start_server().await;
         let client = reqwest::Client::new();
         let resp: serde_json::Value = client
             .post(format!("http://127.0.0.1:{port}/mcp"))
+            .bearer_auth(&token)
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -141,10 +198,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_handle_tools_list() {
-        let (port, _tx) = start_server().await;
+        let (port, token, _tx) = start_server().await;
         let client = reqwest::Client::new();
         let resp: serde_json::Value = client
             .post(format!("http://127.0.0.1:{port}/mcp"))
+            .bearer_auth(&token)
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": 2,
@@ -163,10 +221,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_handle_memory_store() {
-        let (port, _tx) = start_server().await;
+        let (port, token, _tx) = start_server().await;
         let client = reqwest::Client::new();
         let resp: serde_json::Value = client
             .post(format!("http://127.0.0.1:{port}/mcp"))
+            .bearer_auth(&token)
             .json(&json!({
                 "jsonrpc": "2.0",
                 "id": 3,
@@ -195,10 +254,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_parse_error_is_jsonrpc() {
-        let (port, _tx) = start_server().await;
+        let (port, token, _tx) = start_server().await;
         let client = reqwest::Client::new();
         let resp = client
             .post(format!("http://127.0.0.1:{port}/mcp"))
+            .bearer_auth(&token)
             .header("Content-Type", "application/json")
             .body("not json")
             .send()
@@ -214,10 +274,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_invalid_request() {
-        let (port, _tx) = start_server().await;
+        let (port, token, _tx) = start_server().await;
         let client = reqwest::Client::new();
         let resp: serde_json::Value = client
             .post(format!("http://127.0.0.1:{port}/mcp"))
+            .bearer_auth(&token)
             .json(&json!({"jsonrpc": "2.0", "id": 9}))
             .send()
             .await
@@ -232,10 +293,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_notification_returns_202() {
-        let (port, _tx) = start_server().await;
+        let (port, token, _tx) = start_server().await;
         let client = reqwest::Client::new();
         let resp = client
             .post(format!("http://127.0.0.1:{port}/mcp"))
+            .bearer_auth(&token)
             .json(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
             .send()
             .await
@@ -248,10 +310,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_ping() {
-        let (port, _tx) = start_server().await;
+        let (port, token, _tx) = start_server().await;
         let client = reqwest::Client::new();
         let resp: serde_json::Value = client
             .post(format!("http://127.0.0.1:{port}/mcp"))
+            .bearer_auth(&token)
             .json(&json!({"jsonrpc": "2.0", "id": 4, "method": "ping"}))
             .send()
             .await
@@ -261,5 +324,116 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp["result"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_requires_token() {
+        let (port, token, _tx) = start_server().await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        assert_eq!(resp.headers().get("www-authenticate").unwrap(), "Bearer");
+
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .bearer_auth("wrong")
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .bearer_auth(&token)
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_origin_rejected() {
+        let (port, token, _tx) = start_server().await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .bearer_auth(&token)
+            .header("Origin", "http://evil.com")
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+    }
+
+    #[tokio::test]
+    async fn test_host_rejected() {
+        let (port, _token, _tx) = start_server().await;
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let body = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: evil.com\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream.write_all(request.as_bytes()).await.unwrap();
+        stream.write_all(body).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn test_health_is_public() {
+        let (port, _token, _tx) = start_server().await;
+        let client = reqwest::Client::new();
+        let resp: serde_json::Value = client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(resp["name"], "brain-mcp");
+        assert_eq!(resp["pid"], std::process::id());
+        assert_eq!(resp["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_signals() {
+        let (port, token, tx) = start_server().await;
+        let mut rx = tx.subscribe();
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/shutdown"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), rx.wait_for(|v| *v))
+            .await
+            .expect("shutdown signalled")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bind_loopback_falls_back() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = taken.local_addr().unwrap().port();
+        let listener = bind_loopback(p).await.unwrap();
+        assert_ne!(listener.local_addr().unwrap().port(), p);
     }
 }

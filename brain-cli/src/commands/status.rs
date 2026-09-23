@@ -1,14 +1,24 @@
+use std::time::Duration;
+
 use chrono::Utc;
 use serde_json::json;
 
 use brain_server::singleton::Singleton;
 
+use super::server_client::{fetch_identity, loopback_client};
 use super::state_dir;
 use crate::output;
 
 pub async fn run(json: bool) -> anyhow::Result<()> {
     let version = env!("CARGO_PKG_VERSION");
     let state = Singleton::read_live_state(&state_dir());
+
+    let identity = match &state {
+        Some(s) => fetch_identity(&loopback_client(), s, Duration::from_secs(1))
+            .await
+            .ok(),
+        None => None,
+    };
 
     if json {
         let value = match &state {
@@ -18,6 +28,8 @@ pub async fn run(json: bool) -> anyhow::Result<()> {
                 "pid": s.pid,
                 "url": s.http,
                 "started_at": s.started_at.to_rfc3339(),
+                "server_version": identity.as_ref().map(|i| i.version.clone()),
+                "reachable": identity.is_some(),
             }),
             None => json!({
                 "version": version,
@@ -28,7 +40,7 @@ pub async fn run(json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    match state {
+    match &state {
         Some(s) => {
             let uptime = Utc::now().signed_duration_since(s.started_at);
             let uptime_str = format_duration(uptime);
@@ -46,6 +58,15 @@ pub async fn run(json: bool) -> anyhow::Result<()> {
                 "{}",
                 output::info_line("Started", &s.started_at.to_rfc3339())
             );
+            let server_line = match &identity {
+                Some(id) if id.version != version => format!(
+                    "v{} (CLI is v{version}; the next session restarts it)",
+                    id.version
+                ),
+                Some(id) => format!("v{}", id.version),
+                None => "unreachable".to_string(),
+            };
+            println!("{}", output::info_line("Server", &server_line));
         }
         None => {
             println!(

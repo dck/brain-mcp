@@ -3,6 +3,7 @@ pub mod proxy;
 pub mod recall;
 pub mod reindex;
 pub mod serve;
+pub mod server_client;
 pub mod status;
 pub mod stop;
 
