@@ -98,7 +98,7 @@ async fn full_roundtrip() {
         }),
     )
     .await;
-    assert_eq!(resp["error"]["code"], -32602);
+    assert_eq!(resp["result"]["isError"], true);
     assert!(!tmp.path().parent().unwrap().join("evil").exists());
 
     // 4. Search for it

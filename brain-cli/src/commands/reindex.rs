@@ -65,6 +65,14 @@ async fn reindex_via_server(base_url: &str, json_output: bool) -> anyhow::Result
         std::process::exit(1);
     }
 
+    if resp["result"]["isError"] == true {
+        let msg = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("unknown error");
+        eprintln!("{}", output::error(&format!("Reindex failed: {msg}")));
+        std::process::exit(1);
+    }
+
     if json_output {
         println!("{}", serde_json::to_string_pretty(&resp)?);
     } else {

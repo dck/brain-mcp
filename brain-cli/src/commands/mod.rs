@@ -1,4 +1,5 @@
 pub mod init;
+pub mod proxy;
 pub mod recall;
 pub mod reindex;
 pub mod serve;

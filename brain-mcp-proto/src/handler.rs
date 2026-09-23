@@ -6,11 +6,27 @@ use brain_core::error::BrainError;
 use brain_core::model::Filter;
 use brain_core::service::MemoryService;
 
-use crate::jsonrpc::{INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND, Request, Response};
+use crate::jsonrpc::{INVALID_PARAMS, METHOD_NOT_FOUND, Request, Response};
+use crate::mcp::{initialize_result, tool_error, tool_text};
 use crate::schema::tool_definitions;
 
 pub struct McpHandler {
     service: Arc<MemoryService>,
+}
+
+enum ToolError {
+    InvalidParams(String),
+    Failed(BrainError),
+}
+
+impl From<BrainError> for ToolError {
+    fn from(e: BrainError) -> Self {
+        ToolError::Failed(e)
+    }
+}
+
+fn missing(field: &str) -> ToolError {
+    ToolError::InvalidParams(format!("Missing required field: {field}"))
 }
 
 impl McpHandler {
@@ -20,41 +36,15 @@ impl McpHandler {
 
     pub async fn handle(&self, request: Request) -> Response {
         match request.method.as_str() {
-            "initialize" => self.handle_initialize(&request),
-            "notifications/initialized" => Response::success(request.id, json!({})),
+            "initialize" => {
+                Response::success(request.id, initialize_result(request.params.as_ref()))
+            }
+            "ping" => Response::success(request.id, json!({})),
+            m if m.starts_with("notifications/") => Response::success(request.id, json!({})),
             "tools/list" => self.handle_tools_list(&request),
             "tools/call" => self.handle_tools_call(request).await,
             _ => Response::error(request.id, METHOD_NOT_FOUND, "Method not found"),
         }
-    }
-
-    fn handle_initialize(&self, request: &Request) -> Response {
-        Response::success(
-            request.id.clone(),
-            json!({
-                "protocolVersion": "2025-06-18",
-                "capabilities": {
-                    "tools": {}
-                },
-                "serverInfo": {
-                    "name": "brain-mcp",
-                    "version": "0.1.0"
-                },
-                "instructions": "You have persistent cross-project memory via brain-mcp. \
-                    RECALL FIRST: call memory_search at the start of every session and every new task \
-                    (search the project name + task keywords) BEFORE acting. \
-                    Also search when the user says 'always', 'never', 'as usual', or 'we decided', \
-                    when something might have prior context (deployment, setup, a recurring issue), \
-                    and before proposing an approach the user may have already ruled out. \
-                    Searching is cheap and read-only — when in doubt, search. \
-                    Store sparingly: procedures that save time, hard-won debugging insights, \
-                    project conventions, environment-specific quirks. \
-                    Never store: work summaries, refactoring plans, implementation details, generic knowledge, \
-                    things already in code/README/CLAUDE.md. \
-                    Litmus test: would a future session need this AND is it not already in the codebase? \
-                    Write for your future self — include the why, not just the what. Use tags: project name + topic keywords."
-            }),
-        )
     }
 
     fn handle_tools_list(&self, request: &Request) -> Response {
@@ -84,45 +74,31 @@ impl McpHandler {
             "memory_update" => self.tool_update(&args).await,
             "memory_delete" => self.tool_delete(&args).await,
             "memory_reindex" => self.tool_reindex().await,
-            _ => {
-                return Response::error(
-                    request.id,
-                    METHOD_NOT_FOUND,
-                    format!("Unknown tool: {name}"),
-                );
-            }
+            _ => Err(ToolError::InvalidParams(format!("Unknown tool: {name}"))),
         };
 
         match result {
             Ok(value) => Response::success(request.id, value),
-            Err(e) => {
-                let code = match &e {
-                    BrainError::NotFound(_)
-                    | BrainError::AlreadyExists(_)
-                    | BrainError::Duplicate { .. }
-                    | BrainError::InvalidCategory { .. } => INVALID_PARAMS,
-                    _ => INTERNAL_ERROR,
-                };
-                Response::error(request.id, code, e.to_string())
-            }
+            Err(ToolError::InvalidParams(msg)) => Response::error(request.id, INVALID_PARAMS, msg),
+            Err(ToolError::Failed(e)) => Response::success(request.id, tool_error(e.to_string())),
         }
     }
 
-    async fn tool_store(&self, args: &serde_json::Value) -> Result<serde_json::Value, BrainError> {
+    async fn tool_store(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         let content = args
             .get("content")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| BrainError::Vault("Missing required field: content".into()))?
+            .ok_or_else(|| missing("content"))?
             .to_string();
         let title = args
             .get("title")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| BrainError::Vault("Missing required field: title".into()))?
+            .ok_or_else(|| missing("title"))?
             .to_string();
         let tags: Vec<String> = args
             .get("tags")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .ok_or_else(|| BrainError::Vault("Missing required field: tags".into()))?;
+            .ok_or_else(|| missing("tags"))?;
         let category = args
             .get("category")
             .and_then(|v| v.as_str())
@@ -139,14 +115,14 @@ impl McpHandler {
             .store(title, content, tags, category, project, force)
             .await?;
 
-        Ok(text_content(serde_json::to_string(&memory).unwrap()))
+        Ok(tool_text(serde_json::to_string(&memory).unwrap()))
     }
 
-    async fn tool_search(&self, args: &serde_json::Value) -> Result<serde_json::Value, BrainError> {
+    async fn tool_search(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         let query = args
             .get("query")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| BrainError::Vault("Missing required field: query".into()))?;
+            .ok_or_else(|| missing("query"))?;
         let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
         let tags: Option<Vec<String>> = args
             .get("tags")
@@ -160,7 +136,7 @@ impl McpHandler {
         let results = self.service.search(query, limit, &filter).await?;
 
         if results.is_empty() {
-            return Ok(text_content(
+            return Ok(tool_text(
                 "No relevant memories found for this query.".to_string(),
             ));
         }
@@ -175,10 +151,10 @@ impl McpHandler {
             })
             .collect();
 
-        Ok(text_content(serde_json::to_string(&output).unwrap()))
+        Ok(tool_text(serde_json::to_string(&output).unwrap()))
     }
 
-    async fn tool_list(&self, args: &serde_json::Value) -> Result<serde_json::Value, BrainError> {
+    async fn tool_list(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         let tags: Option<Vec<String>> = args
             .get("tags")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
@@ -205,14 +181,14 @@ impl McpHandler {
 
         let metadata = self.service.list(&filter).await?;
 
-        Ok(text_content(serde_json::to_string(&metadata).unwrap()))
+        Ok(tool_text(serde_json::to_string(&metadata).unwrap()))
     }
 
-    async fn tool_update(&self, args: &serde_json::Value) -> Result<serde_json::Value, BrainError> {
+    async fn tool_update(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         let id = args
             .get("id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| BrainError::Vault("Missing required field: id".into()))?;
+            .ok_or_else(|| missing("id"))?;
         let title = args.get("title").and_then(|v| v.as_str()).map(String::from);
         let content = args
             .get("content")
@@ -224,31 +200,25 @@ impl McpHandler {
 
         let memory = self.service.update(id, title, content, tags).await?;
 
-        Ok(text_content(serde_json::to_string(&memory).unwrap()))
+        Ok(tool_text(serde_json::to_string(&memory).unwrap()))
     }
 
-    async fn tool_delete(&self, args: &serde_json::Value) -> Result<serde_json::Value, BrainError> {
+    async fn tool_delete(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
         let id = args
             .get("id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| BrainError::Vault("Missing required field: id".into()))?;
+            .ok_or_else(|| missing("id"))?;
 
         self.service.delete(id).await?;
 
-        Ok(text_content(json!({"deleted": id}).to_string()))
+        Ok(tool_text(json!({"deleted": id}).to_string()))
     }
 
-    async fn tool_reindex(&self) -> Result<serde_json::Value, BrainError> {
+    async fn tool_reindex(&self) -> Result<serde_json::Value, ToolError> {
         let count = self.service.reindex().await?;
 
-        Ok(text_content(json!({"reindexed": count}).to_string()))
+        Ok(tool_text(json!({"reindexed": count}).to_string()))
     }
-}
-
-fn text_content(text: String) -> serde_json::Value {
-    json!({
-        "content": [{ "type": "text", "text": text }]
-    })
 }
 
 #[cfg(test)]
@@ -288,6 +258,30 @@ mod tests {
         assert_eq!(result["protocolVersion"], "2025-06-18");
         assert!(result["capabilities"]["tools"].is_object());
         assert_eq!(result["serverInfo"]["name"], "brain-mcp");
+    }
+
+    #[tokio::test]
+    async fn test_initialize_echoes_client_version() {
+        let handler = make_handler();
+        let req = make_request(
+            "initialize",
+            Some(json!(1)),
+            Some(json!({"protocolVersion": "2024-11-05"})),
+        );
+        let resp = handler.handle(req).await;
+
+        let result = resp.result.unwrap();
+        assert_eq!(result["protocolVersion"], "2024-11-05");
+    }
+
+    #[tokio::test]
+    async fn test_ping_returns_empty_result() {
+        let handler = make_handler();
+        let req = make_request("ping", Some(json!(1)), None);
+        let resp = handler.handle(req).await;
+
+        assert_eq!(resp.result, Some(json!({})));
+        assert!(resp.error.is_none());
     }
 
     #[tokio::test]
@@ -420,8 +414,48 @@ mod tests {
 
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
-        assert_eq!(err.code, METHOD_NOT_FOUND);
+        assert_eq!(err.code, INVALID_PARAMS);
         assert!(err.message.contains("nonexistent_tool"));
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_missing_argument_is_invalid_params() {
+        let handler = make_handler();
+        let req = make_request(
+            "tools/call",
+            Some(json!(5)),
+            Some(json!({
+                "name": "memory_store",
+                "arguments": { "title": "t", "tags": [] }
+            })),
+        );
+        let resp = handler.handle(req).await;
+
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(err.message, "Missing required field: content");
+    }
+
+    #[tokio::test]
+    async fn test_tools_call_service_error_is_tool_error() {
+        let handler = make_handler();
+        let req = make_request(
+            "tools/call",
+            Some(json!(6)),
+            Some(json!({
+                "name": "memory_update",
+                "arguments": { "id": "20990101-nope", "title": "x" }
+            })),
+        );
+        let resp = handler.handle(req).await;
+
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["content"][0]["text"],
+            "Memory not found: 20990101-nope"
+        );
     }
 
     #[tokio::test]
@@ -453,9 +487,15 @@ mod tests {
         );
         let resp = handler.handle(req).await;
 
-        let err = resp.error.unwrap();
-        assert_eq!(err.code, INVALID_PARAMS);
-        assert!(err.message.contains("Allowed categories:"));
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Allowed categories:")
+        );
     }
 
     #[tokio::test]

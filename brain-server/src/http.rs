@@ -1,9 +1,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::body::Bytes;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::{Json, Router, extract::State, routing::post};
 use brain_mcp_proto::handler::McpHandler;
-use brain_mcp_proto::jsonrpc::{Request, Response};
+use brain_mcp_proto::jsonrpc::{INVALID_REQUEST, PARSE_ERROR, Request, Response};
 use tokio::sync::watch;
 
 pub struct HttpServer {
@@ -34,11 +37,35 @@ impl HttpServer {
     }
 }
 
-async fn handle_mcp(
-    State(handler): State<Arc<McpHandler>>,
-    Json(request): Json<Request>,
-) -> Json<Response> {
-    Json(handler.handle(request).await)
+async fn handle_mcp(State(handler): State<Arc<McpHandler>>, body: Bytes) -> HttpResponse {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Json(Response::error(
+                Some(serde_json::Value::Null),
+                PARSE_ERROR,
+                format!("Parse error: {e}"),
+            ))
+            .into_response();
+        }
+    };
+    let id = value.get("id").cloned();
+    let is_notification = value.as_object().is_some_and(|o| !o.contains_key("id"));
+    let request: Request = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(_) => {
+            return Json(Response::error(
+                Some(id.unwrap_or(serde_json::Value::Null)),
+                INVALID_REQUEST,
+                "Invalid request",
+            ))
+            .into_response();
+        }
+    };
+    if is_notification {
+        return StatusCode::ACCEPTED.into_response();
+    }
+    Json(handler.handle(request).await).into_response()
 }
 
 /// Start the server on a random available port.
@@ -164,5 +191,75 @@ mod tests {
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let memory: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(memory["title"], "HTTP Test");
+    }
+
+    #[tokio::test]
+    async fn test_http_parse_error_is_jsonrpc() {
+        let (port, _tx) = start_server().await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .header("Content-Type", "application/json")
+            .body("not json")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], -32700);
+        assert!(body["id"].is_null());
+        assert!(body.as_object().unwrap().contains_key("id"));
+    }
+
+    #[tokio::test]
+    async fn test_http_invalid_request() {
+        let (port, _tx) = start_server().await;
+        let client = reqwest::Client::new();
+        let resp: serde_json::Value = client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .json(&json!({"jsonrpc": "2.0", "id": 9}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(resp["error"]["code"], -32600);
+        assert_eq!(resp["id"], 9);
+    }
+
+    #[tokio::test]
+    async fn test_http_notification_returns_202() {
+        let (port, _tx) = start_server().await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .json(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 202);
+        let body = resp.bytes().await.unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_http_ping() {
+        let (port, _tx) = start_server().await;
+        let client = reqwest::Client::new();
+        let resp: serde_json::Value = client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .json(&json!({"jsonrpc": "2.0", "id": 4, "method": "ping"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(resp["result"], json!({}));
     }
 }
