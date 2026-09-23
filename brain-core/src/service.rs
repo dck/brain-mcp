@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -76,6 +77,8 @@ impl MemoryService {
             category,
             project,
             created_at: now,
+            updated_at: None,
+            extra: BTreeMap::new(),
         };
 
         self.vault.write(&memory).await?;
@@ -145,6 +148,8 @@ impl MemoryService {
             category: existing.category,
             project: existing.project,
             created_at: existing.created_at,
+            updated_at: Some(Utc::now()),
+            extra: existing.extra,
         };
 
         self.vault.write(&updated).await?;
@@ -578,6 +583,61 @@ mod tests {
         assert_eq!(updated.title, "New Title");
         assert_eq!(updated.content, "Original content");
         assert_eq!(updated.tags, vec!["tag1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_update_preserves_extra() {
+        let (vault, _embedder, _index, svc) = make_service();
+
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "aliases".to_string(),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("x".into())]),
+        );
+        let seeded = Memory {
+            id: "20260328-seeded".into(),
+            title: "Original Title".into(),
+            content: "Original content".into(),
+            tags: vec![],
+            category: "learnings".into(),
+            project: None,
+            created_at: Utc::now(),
+            updated_at: None,
+            extra: extra.clone(),
+        };
+        vault.write(&seeded).await.unwrap();
+
+        svc.update(&seeded.id, Some("New Title".into()), None, None)
+            .await
+            .unwrap();
+
+        let from_vault = vault.read(&seeded.id).await.unwrap().unwrap();
+        assert_eq!(from_vault.extra, extra);
+    }
+
+    #[tokio::test]
+    async fn test_update_sets_updated_at() {
+        let (_vault, _embedder, _index, svc) = make_service();
+
+        let mem = svc
+            .store(
+                "Original Title".into(),
+                "Original content".into(),
+                vec![],
+                "learnings".into(),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let updated = svc
+            .update(&mem.id, Some("New Title".into()), None, None)
+            .await
+            .unwrap();
+
+        assert!(updated.updated_at.is_some());
+        assert_eq!(updated.created_at, mem.created_at);
     }
 
     #[tokio::test]

@@ -73,7 +73,7 @@ async fn full_roundtrip() {
         &url,
         "memory_store",
         json!({
-            "title": "Deploy process",
+            "title": "Deploy \"blue/green\" process",
             "content": "Run terraform apply then helm upgrade",
             "tags": ["deploy", "terraform"],
             "category": "procedures"
@@ -95,7 +95,7 @@ async fn full_roundtrip() {
     .await;
     assert!(resp.get("error").is_none(), "search failed: {resp}");
     let results_text = resp["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(results_text.contains("Deploy process"));
+    assert!(results_text.contains("Deploy \\\"blue/green\\\" process"));
 
     // 5. List memories
     let resp = tool_call(
@@ -130,7 +130,8 @@ async fn full_roundtrip() {
         .join("procedures")
         .join(format!("{memory_id}.md"));
     let on_disk = std::fs::read_to_string(&file_path).unwrap();
-    assert!(on_disk.contains("Updated deploy process"));
+    let parsed = brain_vault::frontmatter::parse_markdown(&on_disk).unwrap();
+    assert_eq!(parsed.title, "Updated deploy process");
 
     // 8. Delete it
     let resp = tool_call(&client, &url, "memory_delete", json!({ "id": memory_id })).await;

@@ -77,6 +77,7 @@ fn first_content_line(content: &str) -> Option<String> {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use std::collections::BTreeMap;
 
     fn make_memory(content: &str) -> Memory {
         Memory {
@@ -89,6 +90,8 @@ mod tests {
             created_at: "2026-07-12T10:00:00Z"
                 .parse()
                 .unwrap_or_else(|_| Utc::now()),
+            updated_at: None,
+            extra: BTreeMap::new(),
         }
     }
 

@@ -63,13 +63,17 @@ impl VaultPort for VaultAdapter {
     fn write(&self, memory: &Memory) -> BoxFuture<'_, Result<()>> {
         let memory = memory.clone();
         Box::pin(async move {
-            let content =
-                match load_template(&self.vault_path, &self.templates_dir, &memory.category) {
-                    Some(template) => apply_template(&template, &memory),
-                    None => to_markdown(&memory),
-                };
-
             let path = self.memory_path(&memory.category, &memory.id);
+
+            let mut on_disk = memory.clone();
+            if !path.exists()
+                && let Some(template) =
+                    load_template(&self.vault_path, &self.templates_dir, &memory.category)
+            {
+                on_disk.content = apply_template(&template, &memory);
+            }
+            let content = to_markdown(&on_disk);
+
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| BrainError::Vault(format!("failed to create directory: {e}")))?;
@@ -163,6 +167,7 @@ impl VaultPort for VaultAdapter {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+    use std::collections::BTreeMap;
     use tempfile::tempdir;
 
     fn sample_memory(id: &str, category: &str) -> Memory {
@@ -174,6 +179,8 @@ mod tests {
             category: category.into(),
             project: Some("testproject".into()),
             created_at: Utc.with_ymd_and_hms(2026, 3, 28, 14, 30, 0).unwrap(),
+            updated_at: None,
+            extra: BTreeMap::new(),
         }
     }
 
@@ -353,29 +360,80 @@ mod tests {
         assert_eq!(all[0].id, "20260328-good");
     }
 
+    const LEARNINGS_TEMPLATE: &str = "---\ntitle: \"{{title}}\"\nid: \"{{id}}\"\ntags:\n{{tags}}\ncreated_at: \"{{created_at}}\"\ncategory: {{category}}\n---\n\n## What I Learned\n\n{{content}}\n\n## Why It Matters\n\n## References\n\n";
+
     #[tokio::test]
     async fn test_template_applied_when_exists() {
         let dir = tempdir().unwrap();
         let adapter = VaultAdapter::new(dir.path().to_path_buf(), "_templates".into());
 
-        // Create a template
         let tpl_dir = dir.path().join("_templates");
         std::fs::create_dir_all(&tpl_dir).unwrap();
-        std::fs::write(
-            tpl_dir.join("procedures.md"),
-            "---\ntitle: \"{{title}}\"\nid: \"{{id}}\"\ntags:\n{{tags}}\ncreated_at: \"{{created_at}}\"\ncategory: {{category}}\n---\n\n# {{title}}\n\n{{content}}",
-        )
-        .unwrap();
+        std::fs::write(tpl_dir.join("learnings.md"), LEARNINGS_TEMPLATE).unwrap();
 
-        let memory = sample_memory("20260328-templated", "procedures");
+        let mut memory = sample_memory("20260328-templated", "learnings");
+        memory.title = "Loki \"discarded\" counters".into();
         adapter.write(&memory).await.unwrap();
 
-        let path = dir.path().join("procedures").join("20260328-templated.md");
-        let content = std::fs::read_to_string(path).unwrap();
+        let read_back = adapter.read("20260328-templated").await.unwrap().unwrap();
+        assert_eq!(read_back.title, memory.title);
+        assert_eq!(read_back.project, memory.project);
+        assert!(read_back.content.starts_with("## What I Learned"));
+        assert!(read_back.content.contains("Test content."));
 
-        assert!(content.contains("# Title for 20260328-templated"));
-        assert!(content.contains("  - tag1"));
-        assert!(content.contains("  - tag2"));
+        let path = dir.path().join("learnings").join("20260328-templated.md");
+        let content = std::fs::read_to_string(path).unwrap();
+        assert_eq!(content.lines().filter(|l| *l == "---").count(), 2);
+        assert!(!content.contains("{{"));
+        assert!(content.contains("project: testproject"));
+    }
+
+    #[tokio::test]
+    async fn test_update_does_not_reapply_template() {
+        let dir = tempdir().unwrap();
+        let adapter = VaultAdapter::new(dir.path().to_path_buf(), "_templates".into());
+
+        let tpl_dir = dir.path().join("_templates");
+        std::fs::create_dir_all(&tpl_dir).unwrap();
+        std::fs::write(tpl_dir.join("learnings.md"), LEARNINGS_TEMPLATE).unwrap();
+
+        let memory = sample_memory("20260328-reupdate", "learnings");
+        adapter.write(&memory).await.unwrap();
+
+        let read_back = adapter.read("20260328-reupdate").await.unwrap().unwrap();
+        adapter.write(&read_back).await.unwrap();
+
+        let path = dir.path().join("learnings").join("20260328-reupdate.md");
+        let content = std::fs::read_to_string(path).unwrap();
+        assert_eq!(content.matches("## What I Learned").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_write_preserves_unknown_keys() {
+        let dir = tempdir().unwrap();
+        let adapter = VaultAdapter::new(dir.path().to_path_buf(), "_templates".into());
+
+        write_raw(
+            dir.path(),
+            "learnings",
+            "20260328-unknown-keys",
+            "aliases:\n  - foo\n",
+        );
+
+        let mut memory = adapter
+            .read("20260328-unknown-keys")
+            .await
+            .unwrap()
+            .unwrap();
+        memory.title = "New title".into();
+        adapter.write(&memory).await.unwrap();
+
+        let read_back = adapter
+            .read("20260328-unknown-keys")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(read_back.extra.contains_key("aliases"));
     }
 
     #[tokio::test]
@@ -390,8 +448,7 @@ mod tests {
         let content = std::fs::read_to_string(path).unwrap();
 
         // Should have standard frontmatter format
-        assert!(content.starts_with("---\n"));
         assert!(content.contains("title: Title for 20260328-plain"));
-        assert!(content.contains("Test content."));
+        assert!(content.starts_with("---\nid: "));
     }
 }

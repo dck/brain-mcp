@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +12,10 @@ pub struct Memory {
     pub category: String,
     pub project: Option<String>,
     pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub extra: BTreeMap<String, serde_yaml::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -64,6 +70,8 @@ mod tests {
             category: "learnings".into(),
             project: Some("brain-mcp".into()),
             created_at: Utc::now(),
+            updated_at: None,
+            extra: BTreeMap::new(),
         };
         let meta = Metadata::from(&memory);
         assert_eq!(meta.id, memory.id);

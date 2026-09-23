@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -224,6 +225,8 @@ impl IndexPort for SqliteVecIndex {
                         category: meta.category,
                         project: meta.project,
                         created_at: meta.created_at,
+                        updated_at: None,
+                        extra: BTreeMap::new(),
                     },
                     score,
                 })

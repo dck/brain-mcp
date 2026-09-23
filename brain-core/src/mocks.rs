@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use crate::error::Result;
@@ -182,6 +182,8 @@ impl IndexPort for MockIndex {
                         category: meta.category.clone(),
                         project: meta.project.clone(),
                         created_at: meta.created_at,
+                        updated_at: None,
+                        extra: BTreeMap::new(),
                     },
                     score,
                 })
@@ -289,6 +291,8 @@ mod tests {
             category: "learnings".to_string(),
             project: Some("brain-mcp".to_string()),
             created_at: Utc::now(),
+            updated_at: None,
+            extra: BTreeMap::new(),
         }
     }
 

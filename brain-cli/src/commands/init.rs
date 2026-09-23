@@ -34,16 +34,7 @@ const ALL_CATEGORIES: &[&str] = &[
     "projects",
 ];
 
-const PROCEDURE_TEMPLATE: &str = r#"---
-title: "{{title}}"
-id: "{{id}}"
-tags:
-{{tags}}
-created_at: "{{created_at}}"
-category: {{category}}
----
-
-## Context
+const PROCEDURE_TEMPLATE: &str = r#"## Context
 
 {{content}}
 
@@ -55,16 +46,7 @@ category: {{category}}
 
 "#;
 
-const DECISION_TEMPLATE: &str = r#"---
-title: "{{title}}"
-id: "{{id}}"
-tags:
-{{tags}}
-created_at: "{{created_at}}"
-category: {{category}}
----
-
-## Context
+const DECISION_TEMPLATE: &str = r#"## Context
 
 {{content}}
 
@@ -78,16 +60,7 @@ category: {{category}}
 
 "#;
 
-const LEARNING_TEMPLATE: &str = r#"---
-title: "{{title}}"
-id: "{{id}}"
-tags:
-{{tags}}
-created_at: "{{created_at}}"
-category: {{category}}
----
-
-## What I Learned
+const LEARNING_TEMPLATE: &str = r#"## What I Learned
 
 {{content}}
 
@@ -97,16 +70,7 @@ category: {{category}}
 
 "#;
 
-const CONCEPT_TEMPLATE: &str = r#"---
-title: "{{title}}"
-id: "{{id}}"
-tags:
-{{tags}}
-created_at: "{{created_at}}"
-category: {{category}}
----
-
-## Definition
+const CONCEPT_TEMPLATE: &str = r#"## Definition
 
 {{content}}
 
