@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 use tokio::sync::Mutex;
+use tracing::warn;
 
 use brain_core::error::{BrainError, Result};
-use brain_core::model::{Filter, Memory, Metadata, SearchResult};
+use brain_core::model::{Filter, IndexEntry, Memory, Metadata, SearchResult};
 use brain_core::ports::{BoxFuture, IndexPort};
 
 pub struct SqliteVecIndex {
@@ -17,8 +19,7 @@ pub struct SqliteVecIndex {
 
 impl SqliteVecIndex {
     pub fn open(path: &Path, dims: usize) -> anyhow::Result<Self> {
-        let conn = Connection::open(path)?;
-        create_schema(&conn)?;
+        let conn = prepare_connection(Connection::open(path)?, &path.display().to_string())?;
         Ok(Self {
             conn: Mutex::new(conn),
             dims,
@@ -26,8 +27,7 @@ impl SqliteVecIndex {
     }
 
     pub fn open_in_memory(dims: usize) -> anyhow::Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        create_schema(&conn)?;
+        let conn = prepare_connection(Connection::open_in_memory()?, ":memory:")?;
         Ok(Self {
             conn: Mutex::new(conn),
             dims,
@@ -38,35 +38,70 @@ impl SqliteVecIndex {
 const RECENCY_WEIGHT: f32 = 0.05;
 const RECENCY_DECAY_DAYS: f32 = 90.0;
 
-fn create_schema(conn: &Connection) -> anyhow::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
-         CREATE TABLE IF NOT EXISTS memories (
-             id TEXT PRIMARY KEY,
-             title TEXT NOT NULL,
-             tags TEXT NOT NULL,
-             category TEXT NOT NULL,
-             project TEXT,
-             created_at TEXT NOT NULL,
-             access_count INTEGER NOT NULL DEFAULT 0,
-             last_accessed_at TEXT
-         );
-         CREATE TABLE IF NOT EXISTS memory_vectors (
-             id TEXT PRIMARY KEY,
-             embedding BLOB NOT NULL
-         );",
-    )?;
-    for stmt in [
-        "ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE memories ADD COLUMN last_accessed_at TEXT",
+const MIGRATION_1_SQL: &str = "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+     CREATE TABLE IF NOT EXISTS memories (
+         id TEXT PRIMARY KEY,
+         title TEXT NOT NULL,
+         tags TEXT NOT NULL,
+         category TEXT NOT NULL,
+         project TEXT,
+         created_at TEXT NOT NULL,
+         access_count INTEGER NOT NULL DEFAULT 0,
+         last_accessed_at TEXT
+     );
+     CREATE TABLE IF NOT EXISTS memory_vectors (
+         id TEXT PRIMARY KEY,
+         embedding BLOB NOT NULL
+     );";
+
+type Migration = fn(&Transaction<'_>) -> rusqlite::Result<()>;
+
+const MIGRATIONS: &[Migration] = &[migration_1];
+
+fn migration_1(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(MIGRATION_1_SQL)?;
+    for (column, ddl) in [
+        (
+            "access_count",
+            "ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "last_accessed_at",
+            "ALTER TABLE memories ADD COLUMN last_accessed_at TEXT",
+        ),
     ] {
-        if let Err(e) = conn.execute(stmt, [])
-            && !e.to_string().contains("duplicate column name")
-        {
-            return Err(e.into());
+        let exists = tx
+            .prepare("SELECT 1 FROM pragma_table_info('memories') WHERE name = ?1")?
+            .exists([column])?;
+        if !exists {
+            tx.execute_batch(ddl)?;
         }
     }
     Ok(())
+}
+
+fn migrate(conn: &mut Connection, label: &str) -> anyhow::Result<()> {
+    let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let latest = MIGRATIONS.len() as i64;
+    if current > latest {
+        anyhow::bail!(
+            "index schema version {current} is newer than this brain-mcp supports ({latest}); upgrade brain-mcp or delete {label} to rebuild it"
+        );
+    }
+    for (i, migration) in MIGRATIONS.iter().enumerate().skip(current as usize) {
+        let tx = conn.transaction()?;
+        migration(&tx)?;
+        tx.pragma_update(None, "user_version", (i + 1) as i64)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+fn prepare_connection(mut conn: Connection, label: &str) -> anyhow::Result<Connection> {
+    conn.busy_timeout(Duration::from_secs(5))?;
+    let _mode: String = conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
+    migrate(&mut conn, label)?;
+    Ok(conn)
 }
 
 fn f32_slice_to_bytes(slice: &[f32]) -> Vec<u8> {
@@ -125,7 +160,9 @@ fn row_to_metadata(row: &rusqlite::Row<'_>) -> rusqlite::Result<Metadata> {
     let created_at_str: String = row.get(5)?;
 
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-    let created_at: DateTime<Utc> = created_at_str.parse().unwrap();
+    let created_at: DateTime<Utc> = created_at_str.parse().map_err(|e: chrono::ParseError| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+    })?;
 
     Ok(Metadata {
         id,
@@ -135,6 +172,28 @@ fn row_to_metadata(row: &rusqlite::Row<'_>) -> rusqlite::Result<Metadata> {
         project,
         created_at,
     })
+}
+
+fn write_row(conn: &Connection, id: &str, embedding: &[f32], metadata: &Metadata) -> Result<()> {
+    let tags_json =
+        serde_json::to_string(&metadata.tags).map_err(|e| BrainError::Index(e.to_string()))?;
+    let created_at_str = metadata.created_at.to_rfc3339();
+    let blob = f32_slice_to_bytes(embedding);
+
+    conn.execute(
+        "INSERT INTO memories (id, title, tags, category, project, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(id) DO UPDATE SET title = excluded.title, tags = excluded.tags,
+             category = excluded.category, project = excluded.project, created_at = excluded.created_at",
+        rusqlite::params![id, metadata.title, tags_json, metadata.category, metadata.project, created_at_str],
+    ).map_err(|e| BrainError::Index(e.to_string()))?;
+
+    conn.execute(
+        "INSERT OR REPLACE INTO memory_vectors (id, embedding) VALUES (?1, ?2)",
+        rusqlite::params![id, blob],
+    )
+    .map_err(|e| BrainError::Index(e.to_string()))?;
+
+    Ok(())
 }
 
 impl IndexPort for SqliteVecIndex {
@@ -148,25 +207,12 @@ impl IndexPort for SqliteVecIndex {
         let embedding = embedding.to_vec();
         let metadata = metadata.clone();
         Box::pin(async move {
-            let conn = self.conn.lock().await;
-            let tags_json = serde_json::to_string(&metadata.tags)
+            let mut conn = self.conn.lock().await;
+            let tx = conn
+                .transaction()
                 .map_err(|e| BrainError::Index(e.to_string()))?;
-            let created_at_str = metadata.created_at.to_rfc3339();
-            let blob = f32_slice_to_bytes(&embedding);
-
-            conn.execute(
-                "INSERT INTO memories (id, title, tags, category, project, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(id) DO UPDATE SET title = excluded.title, tags = excluded.tags,
-                     category = excluded.category, project = excluded.project, created_at = excluded.created_at",
-                rusqlite::params![id, metadata.title, tags_json, metadata.category, metadata.project, created_at_str],
-            ).map_err(|e| BrainError::Index(e.to_string()))?;
-
-            conn.execute(
-                "INSERT OR REPLACE INTO memory_vectors (id, embedding) VALUES (?1, ?2)",
-                rusqlite::params![id, blob],
-            )
-            .map_err(|e| BrainError::Index(e.to_string()))?;
-
+            write_row(&tx, &id, &embedding, &metadata)?;
+            tx.commit().map_err(|e| BrainError::Index(e.to_string()))?;
             Ok(())
         })
     }
@@ -199,7 +245,13 @@ impl IndexPort for SqliteVecIndex {
                     Ok((meta, blob))
                 })
                 .map_err(|e| BrainError::Index(e.to_string()))?
-                .filter_map(|r| r.ok())
+                .filter_map(|r| match r {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warn!("skipping index row: {e}");
+                        None
+                    }
+                })
                 .filter(|(meta, _)| matches_filter(meta, &filter))
                 .map(|(meta, blob)| {
                     let vec = bytes_to_f32_vec(&blob);
@@ -260,7 +312,13 @@ impl IndexPort for SqliteVecIndex {
             let all: Vec<Metadata> = stmt
                 .query_map([], row_to_metadata)
                 .map_err(|e| BrainError::Index(e.to_string()))?
-                .filter_map(|r| r.ok())
+                .filter_map(|r| match r {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warn!("skipping index row: {e}");
+                        None
+                    }
+                })
                 .filter(|meta| matches_filter(meta, &filter))
                 .collect();
 
@@ -271,26 +329,63 @@ impl IndexPort for SqliteVecIndex {
     fn record_access(&self, ids: &[String]) -> BoxFuture<'_, Result<()>> {
         let ids = ids.to_vec();
         Box::pin(async move {
-            let conn = self.conn.lock().await;
+            let mut conn = self.conn.lock().await;
             let now = Utc::now().to_rfc3339();
-            for id in &ids {
-                conn.execute(
-                    "UPDATE memories SET access_count = access_count + 1, last_accessed_at = ?1 WHERE id = ?2",
-                    rusqlite::params![now, id],
-                )
+            let tx = conn
+                .transaction()
                 .map_err(|e| BrainError::Index(e.to_string()))?;
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "UPDATE memories SET access_count = access_count + 1, last_accessed_at = ?1 WHERE id = ?2",
+                    )
+                    .map_err(|e| BrainError::Index(e.to_string()))?;
+                for id in &ids {
+                    stmt.execute(rusqlite::params![now, id])
+                        .map_err(|e| BrainError::Index(e.to_string()))?;
+                }
             }
+            tx.commit().map_err(|e| BrainError::Index(e.to_string()))?;
             Ok(())
         })
     }
 
-    fn clear(&self) -> BoxFuture<'_, Result<()>> {
+    fn rebuild(&self, entries: Vec<IndexEntry>, model_id: &str) -> BoxFuture<'_, Result<()>> {
+        let model_id = model_id.to_string();
         Box::pin(async move {
-            let conn = self.conn.lock().await;
-            conn.execute("DELETE FROM memories", [])
+            let mut conn = self.conn.lock().await;
+            let tx = conn
+                .transaction()
                 .map_err(|e| BrainError::Index(e.to_string()))?;
-            conn.execute("DELETE FROM memory_vectors", [])
-                .map_err(|e| BrainError::Index(e.to_string()))?;
+            let keep: std::collections::HashSet<&str> =
+                entries.iter().map(|e| e.metadata.id.as_str()).collect();
+            for entry in &entries {
+                write_row(&tx, &entry.metadata.id, &entry.embedding, &entry.metadata)?;
+            }
+            let existing: Vec<String> = {
+                let mut stmt = tx
+                    .prepare("SELECT id FROM memories")
+                    .map_err(|e| BrainError::Index(e.to_string()))?;
+                stmt.query_map([], |r| r.get(0))
+                    .map_err(|e| BrainError::Index(e.to_string()))?
+                    .collect::<rusqlite::Result<_>>()
+                    .map_err(|e| BrainError::Index(e.to_string()))?
+            };
+            for id in existing.iter().filter(|id| !keep.contains(id.as_str())) {
+                tx.execute("DELETE FROM memories WHERE id = ?1", [id])
+                    .map_err(|e| BrainError::Index(e.to_string()))?;
+            }
+            tx.execute(
+                "DELETE FROM memory_vectors WHERE id NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| BrainError::Index(e.to_string()))?;
+            tx.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('model_id', ?1)",
+                [&model_id],
+            )
+            .map_err(|e| BrainError::Index(e.to_string()))?;
+            tx.commit().map_err(|e| BrainError::Index(e.to_string()))?;
             Ok(())
         })
     }
@@ -467,28 +562,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_clear() {
-        let index = SqliteVecIndex::open_in_memory(3).unwrap();
-
-        for i in 1..=3 {
-            let id = format!("m{i}");
-            let meta = make_metadata(&id, "learnings", vec![], None);
-            index.upsert(&id, &[1.0, 0.0, 0.0], &meta).await.unwrap();
-        }
-
-        index.clear().await.unwrap();
-
-        let all = index.list(&Filter::default()).await.unwrap();
-        assert!(all.is_empty());
-
-        let results = index
-            .search(&[1.0, 0.0, 0.0], 10, &Filter::default())
-            .await
-            .unwrap();
-        assert!(results.is_empty());
-    }
-
-    #[tokio::test]
     async fn test_search_recency_breaks_ties() {
         let index = SqliteVecIndex::open_in_memory(3).unwrap();
 
@@ -565,5 +638,303 @@ mod tests {
         let index = SqliteVecIndex::open_in_memory(3).unwrap();
         let stored = index.stored_model_id().await.unwrap();
         assert_eq!(stored, None);
+    }
+
+    #[tokio::test]
+    async fn test_fresh_db_is_at_latest_version() {
+        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let conn = index.conn.lock().await;
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as i64);
+    }
+
+    #[tokio::test]
+    async fn test_file_db_uses_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = SqliteVecIndex::open(&dir.path().join("index.db"), 3).unwrap();
+        let conn = index.conn.lock().await;
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+    }
+
+    #[tokio::test]
+    async fn test_migrates_legacy_db_without_access_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE memories (
+                     id TEXT PRIMARY KEY,
+                     title TEXT NOT NULL,
+                     tags TEXT NOT NULL,
+                     category TEXT NOT NULL,
+                     project TEXT,
+                     created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE memory_vectors (
+                     id TEXT PRIMARY KEY,
+                     embedding BLOB NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memories (id, title, tags, category, project, created_at) VALUES ('m1', 'Title', '[]', 'learnings', NULL, ?1)",
+                rusqlite::params![Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO memory_vectors (id, embedding) VALUES ('m1', ?1)",
+                rusqlite::params![f32_slice_to_bytes(&[1.0, 0.0, 0.0])],
+            )
+            .unwrap();
+        }
+
+        let index = SqliteVecIndex::open(&path, 3).unwrap();
+        {
+            let conn = index.conn.lock().await;
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 1);
+            for column in ["access_count", "last_accessed_at"] {
+                let exists = conn
+                    .prepare("SELECT 1 FROM pragma_table_info('memories') WHERE name = ?1")
+                    .unwrap()
+                    .exists([column])
+                    .unwrap();
+                assert!(exists, "missing column {column}");
+            }
+        }
+
+        let all = index.list(&Filter::default()).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, "m1");
+        index.record_access(&["m1".to_string()]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_migration_1_keeps_unversioned_current_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_1_SQL).unwrap();
+            conn.execute(
+                "INSERT INTO memories (id, title, tags, category, project, created_at, access_count) VALUES ('m1', 'Title', '[]', 'learnings', NULL, ?1, 3)",
+                rusqlite::params![Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        let index = SqliteVecIndex::open(&path, 3).unwrap();
+        let conn = index.conn.lock().await;
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        let access_count: i64 = conn
+            .query_row(
+                "SELECT access_count FROM memories WHERE id = 'm1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(access_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_reopen_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+
+        {
+            let index = SqliteVecIndex::open(&path, 3).unwrap();
+            let meta = make_metadata("m1", "learnings", vec![], None);
+            index.upsert("m1", &[1.0, 0.0, 0.0], &meta).await.unwrap();
+        }
+
+        let index = SqliteVecIndex::open(&path, 3).unwrap();
+        let conn = index.conn.lock().await;
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        drop(conn);
+        let all = index.list(&Filter::default()).await.unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_rejects_newer_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 99;").unwrap();
+        }
+
+        match SqliteVecIndex::open(&path, 3) {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => assert!(e.to_string().contains("newer than this brain-mcp supports")),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_preserves_access_stats() {
+        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let m1 = make_metadata("m1", "learnings", vec![], None);
+        let m2 = make_metadata("m2", "learnings", vec![], None);
+        index.upsert("m1", &[1.0, 0.0, 0.0], &m1).await.unwrap();
+        index.upsert("m2", &[0.0, 1.0, 0.0], &m2).await.unwrap();
+        index.record_access(&["m1".to_string()]).await.unwrap();
+        index.record_access(&["m1".to_string()]).await.unwrap();
+
+        let mut new_m1 = make_metadata("m1", "learnings", vec![], None);
+        new_m1.title = "New Title".to_string();
+        let m3 = make_metadata("m3", "learnings", vec![], None);
+        index
+            .rebuild(
+                vec![
+                    IndexEntry {
+                        embedding: vec![0.0, 1.0, 0.0],
+                        metadata: new_m1,
+                    },
+                    IndexEntry {
+                        embedding: vec![0.0, 0.0, 1.0],
+                        metadata: m3,
+                    },
+                ],
+                "new-model",
+            )
+            .await
+            .unwrap();
+
+        let all = index.list(&Filter::default()).await.unwrap();
+        let mut ids: Vec<&str> = all.iter().map(|m| m.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["m1", "m3"]);
+
+        let conn = index.conn.lock().await;
+        let (count, last, title): (i64, Option<String>, String) = conn
+            .query_row(
+                "SELECT access_count, last_accessed_at, title FROM memories WHERE id = 'm1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(last.is_some());
+        assert_eq!(title, "New Title");
+
+        let vector_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vectors WHERE id = 'm2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vector_count, 0);
+        let memory_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories WHERE id = 'm2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(memory_count, 0);
+        drop(conn);
+
+        let results = index
+            .search(&[0.0, 1.0, 0.0], 10, &Filter::default())
+            .await
+            .unwrap();
+        assert_eq!(results[0].memory.id, "m1");
+        assert!((results[0].score - 1.0).abs() < 1e-6);
+
+        assert_eq!(
+            index.stored_model_id().await.unwrap(),
+            Some("new-model".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_empty_entries_empties_index() {
+        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        for i in 1..=3 {
+            let id = format!("m{i}");
+            let meta = make_metadata(&id, "learnings", vec![], None);
+            index.upsert(&id, &[1.0, 0.0, 0.0], &meta).await.unwrap();
+        }
+
+        index.rebuild(vec![], "model").await.unwrap();
+
+        let conn = index.conn.lock().await;
+        let memory_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        let vector_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(memory_count, 0);
+        assert_eq!(vector_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_removes_orphan_vectors() {
+        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        {
+            let conn = index.conn.lock().await;
+            conn.execute(
+                "INSERT INTO memory_vectors (id, embedding) VALUES ('orphan', ?1)",
+                rusqlite::params![f32_slice_to_bytes(&[1.0, 0.0, 0.0])],
+            )
+            .unwrap();
+        }
+
+        index.rebuild(vec![], "model").await.unwrap();
+
+        let conn = index.conn.lock().await;
+        let vector_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vector_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_bad_created_at_row_is_skipped() {
+        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        let m1 = make_metadata("m1", "learnings", vec![], None);
+        index.upsert("m1", &[1.0, 0.0, 0.0], &m1).await.unwrap();
+        {
+            let conn = index.conn.lock().await;
+            conn.execute(
+                "UPDATE memories SET created_at = 'garbage' WHERE id = 'm1'",
+                [],
+            )
+            .unwrap();
+        }
+        let m2 = make_metadata("m2", "learnings", vec![], None);
+        index.upsert("m2", &[1.0, 0.0, 0.0], &m2).await.unwrap();
+
+        let all = index.list(&Filter::default()).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, "m2");
+
+        let results = index
+            .search(&[1.0, 0.0, 0.0], 10, &Filter::default())
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].memory.id, "m2");
+    }
+
+    #[tokio::test]
+    async fn test_record_access_unknown_id_is_noop() {
+        let index = SqliteVecIndex::open_in_memory(3).unwrap();
+        index.record_access(&["nope".to_string()]).await.unwrap();
     }
 }

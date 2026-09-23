@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use crate::error::Result;
-use crate::model::{Filter, Memory, Metadata, SearchResult};
+use crate::model::{Filter, IndexEntry, Memory, Metadata, SearchResult};
 use crate::ports::{BoxFuture, EmbeddingPort, IndexPort, VaultPort};
 
 // ---------------------------------------------------------------------------
@@ -223,9 +223,19 @@ impl IndexPort for MockIndex {
         })
     }
 
-    fn clear(&self) -> BoxFuture<'_, Result<()>> {
+    fn rebuild(&self, entries: Vec<IndexEntry>, model_id: &str) -> BoxFuture<'_, Result<()>> {
+        let model_id = model_id.to_string();
         Box::pin(async move {
-            self.store.lock().unwrap().clear();
+            let mut store = self.store.lock().unwrap();
+            store.clear();
+            for entry in entries {
+                store.insert(entry.metadata.id.clone(), (entry.embedding, entry.metadata));
+            }
+            self.accesses
+                .lock()
+                .unwrap()
+                .retain(|id, _| store.contains_key(id));
+            *self.model_id.lock().unwrap() = Some(model_id);
             Ok(())
         })
     }
@@ -405,6 +415,38 @@ mod tests {
         assert_eq!(
             idx.stored_model_id().await.unwrap(),
             Some("test-model".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn index_rebuild_replaces_and_keeps_accesses() {
+        let idx = MockIndex::new();
+        let m1 = sample_memory("1", "First");
+        let m2 = sample_memory("2", "Second");
+        idx.upsert("1", &[1.0, 0.0], &meta_from(&m1)).await.unwrap();
+        idx.upsert("2", &[0.0, 1.0], &meta_from(&m2)).await.unwrap();
+        idx.record_access(&["1".to_string(), "2".to_string()])
+            .await
+            .unwrap();
+
+        idx.rebuild(
+            vec![IndexEntry {
+                embedding: vec![1.0, 0.0],
+                metadata: meta_from(&m1),
+            }],
+            "new-model",
+        )
+        .await
+        .unwrap();
+
+        let all = idx.list(&Filter::default()).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, "1");
+        assert_eq!(idx.access_count("1"), 1);
+        assert_eq!(idx.access_count("2"), 0);
+        assert_eq!(
+            idx.stored_model_id().await.unwrap(),
+            Some("new-model".to_string())
         );
     }
 }

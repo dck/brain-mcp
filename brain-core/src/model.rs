@@ -47,6 +47,12 @@ pub struct SearchResult {
     pub score: f32,
 }
 
+#[derive(Debug, Clone)]
+pub struct IndexEntry {
+    pub embedding: Vec<f32>,
+    pub metadata: Metadata,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
     pub tags: Option<Vec<String>>,

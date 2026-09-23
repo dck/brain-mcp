@@ -7,7 +7,7 @@ use tracing::warn;
 use crate::config::default_categories;
 use crate::error::{BrainError, Result};
 use crate::id::generate_id;
-use crate::model::{Filter, Memory, Metadata, SearchResult};
+use crate::model::{Filter, IndexEntry, Memory, Metadata, SearchResult};
 use crate::ports::{EmbeddingPort, IndexPort, VaultPort};
 
 const DUPLICATE_THRESHOLD: f32 = 0.9;
@@ -190,11 +190,7 @@ impl MemoryService {
     }
 
     pub async fn reindex(&self) -> Result<usize> {
-        self.index.clear().await?;
-        self.index.set_model_id(self.embedder.model_id()).await?;
-
         let memories = self.vault.list_all().await?;
-        let count = memories.len();
 
         let mut unknown: BTreeMap<&str, usize> = BTreeMap::new();
         for memory in &memories {
@@ -208,11 +204,27 @@ impl MemoryService {
             );
         }
 
+        if memories.is_empty() {
+            let existing = self.index.list(&Filter::default()).await?.len();
+            if existing > 0 {
+                return Err(BrainError::Vault(format!(
+                    "vault at the configured path has no readable memories but the index has {existing}; refusing to empty the index. Check vault.path, or delete the index file to start over."
+                )));
+            }
+        }
+
+        let mut entries = Vec::with_capacity(memories.len());
         for memory in &memories {
             let embedding = self.embedder.embed(&memory.content).await?;
-            let metadata = Metadata::from(memory);
-            self.index.upsert(&memory.id, &embedding, &metadata).await?;
+            entries.push(IndexEntry {
+                embedding,
+                metadata: Metadata::from(memory),
+            });
         }
+        let count = entries.len();
+        self.index
+            .rebuild(entries, self.embedder.model_id())
+            .await?;
 
         Ok(count)
     }
@@ -708,7 +720,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reindex_reembeds_all() {
-        let (_vault, _embedder, index, svc) = make_service();
+        let (vault, embedder, _index, svc) = make_service();
 
         for title in &["One", "Two", "Three"] {
             svc.store(
@@ -723,13 +735,196 @@ mod tests {
             .unwrap();
         }
 
-        // Clear index directly to simulate stale state
-        index.clear().await.unwrap();
-        assert!(index.list(&Filter::default()).await.unwrap().is_empty());
+        let fresh_index = Arc::new(MockIndex::new());
+        let fresh_svc = MemoryService::new(vault, embedder, fresh_index.clone());
+
+        let count = fresh_svc.reindex().await.unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(fresh_index.list(&Filter::default()).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_reindex_preserves_access_counts() {
+        let (_vault, _embedder, index, svc) = make_service();
+
+        let mem = svc
+            .store(
+                "Accessed".into(),
+                "some searchable content".into(),
+                vec![],
+                "learnings".into(),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        svc.search("some searchable content", 10, &Filter::default())
+            .await
+            .unwrap();
+        svc.search("some searchable content", 10, &Filter::default())
+            .await
+            .unwrap();
+        assert_eq!(index.access_count(&mem.id), 2);
+
+        svc.reindex().await.unwrap();
+
+        assert_eq!(index.access_count(&mem.id), 2);
+    }
+
+    #[tokio::test]
+    async fn test_reindex_drops_memories_deleted_from_vault() {
+        let (vault, _embedder, index, svc) = make_service();
+
+        let a = svc
+            .store(
+                "A".into(),
+                "content a".into(),
+                vec![],
+                "learnings".into(),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let b = svc
+            .store(
+                "B".into(),
+                "content b".into(),
+                vec![],
+                "learnings".into(),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        vault.delete(&b.id).await.unwrap();
+
+        svc.reindex().await.unwrap();
+
+        let listed = index.list(&Filter::default()).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, a.id);
+    }
+
+    struct FailingEmbedder;
+
+    impl EmbeddingPort for FailingEmbedder {
+        fn embed(&self, _text: &str) -> crate::ports::BoxFuture<'_, Result<Vec<f32>>> {
+            Box::pin(async { Err(BrainError::Embedding("boom".into())) })
+        }
+
+        fn dimensions(&self) -> usize {
+            8
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-embed-v0"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reindex_failure_leaves_index_intact() {
+        let (vault, _embedder, index, svc) = make_service();
+
+        svc.store(
+            "A".into(),
+            "content a".into(),
+            vec![],
+            "learnings".into(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        svc.store(
+            "B".into(),
+            "content b".into(),
+            vec![],
+            "learnings".into(),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let failing = MemoryService::new(vault, Arc::new(FailingEmbedder), index.clone());
+        let result = failing.reindex().await;
+
+        assert!(result.is_err());
+        assert_eq!(index.list(&Filter::default()).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_reindex_refuses_to_empty_index_from_empty_vault() {
+        let (_vault, embedder, index, svc) = make_service();
+
+        svc.store(
+            "A".into(),
+            "content a".into(),
+            vec![],
+            "learnings".into(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let empty_vault_svc =
+            MemoryService::new(Arc::new(MockVault::new()), embedder, index.clone());
+        let result = empty_vault_svc.reindex().await;
+
+        match result.unwrap_err() {
+            BrainError::Vault(msg) => assert!(msg.contains("refusing to empty the index")),
+            other => panic!("expected Vault error, got {other:?}"),
+        }
+        assert_eq!(index.list(&Filter::default()).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_reindex_empty_vault_and_empty_index_is_ok() {
+        let (_vault, _embedder, _index, svc) = make_service();
 
         let count = svc.reindex().await.unwrap();
-        assert_eq!(count, 3);
-        assert_eq!(index.list(&Filter::default()).await.unwrap().len(), 3);
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reindex_after_model_change_keeps_access() {
+        let (_vault, _embedder, index, svc) = make_service();
+
+        let mem = svc
+            .store(
+                "Accessed".into(),
+                "some searchable content".into(),
+                vec![],
+                "learnings".into(),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        svc.search("some searchable content", 10, &Filter::default())
+            .await
+            .unwrap();
+        assert_eq!(index.access_count(&mem.id), 1);
+
+        index.set_model_id("old-model").await.unwrap();
+        assert!(matches!(
+            svc.check_model_compatibility().await.unwrap_err(),
+            BrainError::ModelMismatch { .. }
+        ));
+
+        svc.reindex().await.unwrap();
+
+        svc.check_model_compatibility().await.unwrap();
+        assert_eq!(
+            index.stored_model_id().await.unwrap(),
+            Some("mock-embed-v0".to_string())
+        );
+        assert_eq!(index.access_count(&mem.id), 1);
     }
 
     #[tokio::test]

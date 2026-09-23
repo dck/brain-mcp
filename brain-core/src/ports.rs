@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::error::Result;
-use crate::model::{Filter, Memory, Metadata, SearchResult};
+use crate::model::{Filter, IndexEntry, Memory, Metadata, SearchResult};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -31,7 +31,7 @@ pub trait IndexPort: Send + Sync {
     fn delete(&self, id: &str) -> BoxFuture<'_, Result<()>>;
     fn list(&self, filter: &Filter) -> BoxFuture<'_, Result<Vec<Metadata>>>;
     fn record_access(&self, ids: &[String]) -> BoxFuture<'_, Result<()>>;
-    fn clear(&self) -> BoxFuture<'_, Result<()>>;
+    fn rebuild(&self, entries: Vec<IndexEntry>, model_id: &str) -> BoxFuture<'_, Result<()>>;
     fn stored_model_id(&self) -> BoxFuture<'_, Result<Option<String>>>;
     fn set_model_id(&self, model_id: &str) -> BoxFuture<'_, Result<()>>;
 }
