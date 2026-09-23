@@ -2,13 +2,15 @@ use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use brain_mcp_proto::jsonrpc::{INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR, Request, Response};
 use brain_mcp_proto::mcp::{SERVER_VERSION, initialize_result, tool_error};
 use brain_mcp_proto::schema::tool_definitions;
+use brain_server::auth::generate_token;
 use brain_server::identity::{ServerIdentity, current_exe_path, parse_version};
+use brain_server::lifecycle::{HEARTBEAT_INTERVAL, SESSION_HEADER};
 use brain_server::singleton::{ServerState, Singleton};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -82,6 +84,8 @@ struct Upstream {
     conn: tokio::sync::Mutex<Option<ServerState>>,
     spawn_enabled: bool,
     consecutive_timeouts: AtomicU32,
+    session_id: String,
+    heartbeat_started: AtomicBool,
 }
 
 impl Upstream {
@@ -92,6 +96,49 @@ impl Upstream {
             conn: tokio::sync::Mutex::new(None),
             spawn_enabled,
             consecutive_timeouts: AtomicU32::new(0),
+            session_id: format!("{}-{}", std::process::id(), &generate_token()[..8]),
+            heartbeat_started: AtomicBool::new(false),
+        }
+    }
+
+    fn start_heartbeat(self: &Arc<Self>) {
+        if self.heartbeat_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let up = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+                let Some(state) = up.conn.lock().await.clone() else {
+                    continue;
+                };
+                let ok = up
+                    .client
+                    .post(state.url("/session/heartbeat"))
+                    .bearer_auth(&state.token)
+                    .header(SESSION_HEADER, &up.session_id)
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await
+                    .is_ok_and(|r| r.status().is_success());
+                if !ok {
+                    up.invalidate().await;
+                }
+            }
+        });
+    }
+
+    async fn close_session(&self) {
+        let state = self.conn.lock().await.clone();
+        if let Some(state) = state {
+            let _ = self
+                .client
+                .post(state.url("/session/close"))
+                .bearer_auth(&state.token)
+                .header(SESSION_HEADER, &self.session_id)
+                .timeout(Duration::from_millis(500))
+                .send()
+                .await;
         }
     }
 
@@ -188,6 +235,7 @@ impl Upstream {
             .client
             .post(&state.http)
             .header("Content-Type", "application/json")
+            .header(SESSION_HEADER, &self.session_id)
             .bearer_auth(&state.token)
             .body(body.to_vec())
             .timeout(timeout)
@@ -420,7 +468,9 @@ async fn handle_line(line: String, upstream: Arc<Upstream>) -> Outcome {
         "initialize" => {
             let up = upstream.clone();
             tokio::spawn(async move {
-                let _ = up.ensure().await;
+                if up.ensure().await.is_ok() {
+                    up.start_heartbeat();
+                }
             });
             Outcome::Reply(encode(&Response::success(
                 id,
@@ -445,7 +495,10 @@ async fn handle_line(line: String, upstream: Arc<Upstream>) -> Outcome {
                 TOOL_TIMEOUT
             };
             match upstream.forward(line, timeout).await {
-                Ok(body) => Outcome::Reply(body),
+                Ok(body) => {
+                    upstream.start_heartbeat();
+                    Outcome::Reply(body)
+                }
                 Err(e) => Outcome::Reply(encode(&Response::success(
                     id,
                     tool_error(unavailable_message(&e, &upstream.state_dir)),
@@ -488,17 +541,34 @@ pub async fn run(state_dir: PathBuf) -> anyhow::Result<()> {
         Ok(())
     });
     let mut tasks = tokio::task::JoinSet::new();
-    while let Some(line) = line_rx.recv().await {
-        let upstream = upstream.clone();
-        let out_tx = out_tx.clone();
-        tasks.spawn(async move {
-            if let Outcome::Reply(frame) = handle_line(line, upstream).await {
-                let _ = out_tx.send(frame);
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    loop {
+        tokio::select! {
+            line = line_rx.recv() => match line {
+                Some(line) => {
+                    let upstream = upstream.clone();
+                    let out_tx = out_tx.clone();
+                    tasks.spawn(async move {
+                        if let Outcome::Reply(frame) = handle_line(line, upstream).await {
+                            let _ = out_tx.send(frame);
+                        }
+                    });
+                    while tasks.try_join_next().is_some() {}
+                }
+                None => break,
+            },
+            _ = tokio::signal::ctrl_c() => {
+                upstream.close_session().await;
+                return Ok(());
             }
-        });
-        while tasks.try_join_next().is_some() {}
+            _ = term.recv() => {
+                upstream.close_session().await;
+                return Ok(());
+            }
+        }
     }
     while tasks.join_next().await.is_some() {}
+    upstream.close_session().await;
     drop(out_tx);
     writer
         .join()
@@ -665,6 +735,69 @@ mod tests {
             .await
             .unwrap();
         (port, shutdown_tx)
+    }
+
+    async fn start_test_server_with_sessions(
+        token: String,
+    ) -> (u16, Arc<brain_server::lifecycle::SessionTracker>) {
+        let vault = Arc::new(brain_core::mocks::MockVault::new());
+        let embedder = Arc::new(brain_core::mocks::MockEmbedder::new(8));
+        let index = Arc::new(brain_core::mocks::MockIndex::new());
+        let service = Arc::new(brain_core::service::MemoryService::new(
+            vault, embedder, index,
+        ));
+        let handler = Arc::new(brain_mcp_proto::handler::McpHandler::new(service));
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        let sessions = brain_server::lifecycle::SessionTracker::new(
+            brain_server::lifecycle::LEASE,
+            Duration::ZERO,
+            shutdown_tx.clone(),
+        );
+        let server = brain_server::http::HttpServer::new(
+            handler,
+            ServerIdentity::current(chrono::Utc::now()),
+            token,
+            shutdown_tx,
+            sessions.clone(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        (port, sessions)
+    }
+
+    #[tokio::test]
+    async fn forward_touches_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = brain_server::auth::generate_token();
+        let (port, sessions) = start_test_server_with_sessions(token.clone()).await;
+
+        let singleton = Singleton::acquire(dir.path()).unwrap();
+        singleton
+            .write_state(&ServerState {
+                pid: std::process::id(),
+                http: format!("http://127.0.0.1:{port}/mcp"),
+                started_at: chrono::Utc::now(),
+                version: SERVER_VERSION.to_string(),
+                token: token.clone(),
+            })
+            .unwrap();
+
+        let upstream = Arc::new(Upstream::new(dir.path().to_path_buf(), false));
+        upstream
+            .forward(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_list","arguments":{}}}"#
+                    .to_string(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sessions.active(), 1);
+
+        upstream.close_session().await;
+        assert_eq!(sessions.active(), 0);
     }
 
     #[tokio::test]

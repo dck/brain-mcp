@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -14,6 +15,7 @@ use tokio::sync::watch;
 
 use crate::auth;
 use crate::identity::ServerIdentity;
+use crate::lifecycle::{LEASE, SESSION_HEADER, SessionTracker};
 
 #[derive(Clone)]
 struct AppState {
@@ -21,6 +23,7 @@ struct AppState {
     identity: Arc<ServerIdentity>,
     token: Arc<str>,
     shutdown: watch::Sender<bool>,
+    sessions: Arc<SessionTracker>,
 }
 
 pub struct HttpServer {
@@ -33,6 +36,7 @@ impl HttpServer {
         identity: ServerIdentity,
         token: String,
         shutdown: watch::Sender<bool>,
+        sessions: Arc<SessionTracker>,
     ) -> Self {
         Self {
             state: AppState {
@@ -40,6 +44,7 @@ impl HttpServer {
                 identity: Arc::new(identity),
                 token: Arc::from(token),
                 shutdown,
+                sessions,
             },
         }
     }
@@ -49,6 +54,8 @@ impl HttpServer {
             .route("/health", get(handle_health))
             .route("/mcp", post(handle_mcp))
             .route("/shutdown", post(handle_shutdown))
+            .route("/session/heartbeat", post(handle_heartbeat))
+            .route("/session/close", post(handle_close))
             .with_state(self.state.clone())
     }
 
@@ -74,17 +81,57 @@ pub async fn bind_loopback(port: u16) -> std::io::Result<tokio::net::TcpListener
     }
 }
 
+fn touch_session(s: &AppState, headers: &HeaderMap) -> Option<String> {
+    let id = headers.get(SESSION_HEADER)?.to_str().ok()?.to_string();
+    s.sessions.touch(&id);
+    Some(id)
+}
+
 async fn handle_health(State(s): State<AppState>, headers: HeaderMap) -> HttpResponse {
     if let Err(r) = auth::check(&headers, None) {
         return r.into_response();
     }
-    Json((*s.identity).clone()).into_response()
+    let mut v = serde_json::to_value(&*s.identity).expect("identity serializes");
+    v["sessions"] = json!(s.sessions.active());
+    Json(v).into_response()
+}
+
+async fn handle_heartbeat(State(s): State<AppState>, headers: HeaderMap) -> HttpResponse {
+    if let Err(r) = auth::check(&headers, Some(&s.token)) {
+        return r.into_response();
+    }
+    match touch_session(&s, &headers) {
+        Some(_) => StatusCode::NO_CONTENT.into_response(),
+        None => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "missing x-brain-session"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_close(State(s): State<AppState>, headers: HeaderMap) -> HttpResponse {
+    if let Err(r) = auth::check(&headers, Some(&s.token)) {
+        return r.into_response();
+    }
+    match headers.get(SESSION_HEADER).and_then(|v| v.to_str().ok()) {
+        Some(id) => {
+            s.sessions.close(id);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        None => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "missing x-brain-session"})),
+        )
+            .into_response(),
+    }
 }
 
 async fn handle_mcp(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> HttpResponse {
     if let Err(r) = auth::check(&headers, Some(&s.token)) {
         return r.into_response();
     }
+    touch_session(&s, &headers);
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -135,11 +182,13 @@ pub async fn run_on_random_port(
 ) -> anyhow::Result<u16> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
+    let sessions = SessionTracker::new(LEASE, Duration::ZERO, shutdown.clone());
     let server = HttpServer::new(
         handler,
         ServerIdentity::current(chrono::Utc::now()),
         token,
         shutdown,
+        sessions,
     );
     tokio::spawn(async move {
         let _ = server.serve(listener).await;
@@ -171,6 +220,26 @@ mod tests {
             .await
             .unwrap();
         (port, token, tx)
+    }
+
+    async fn start_server_with_sessions() -> (u16, String, Arc<SessionTracker>) {
+        let handler = make_handler();
+        let token = generate_token();
+        let (tx, _rx) = watch::channel(false);
+        let sessions = SessionTracker::new(LEASE, Duration::ZERO, tx.clone());
+        let server = HttpServer::new(
+            handler,
+            ServerIdentity::current(chrono::Utc::now()),
+            token.clone(),
+            tx,
+            sessions.clone(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = server.serve(listener).await;
+        });
+        (port, token, sessions)
     }
 
     #[tokio::test]
@@ -435,5 +504,90 @@ mod tests {
         let p = taken.local_addr().unwrap().port();
         let listener = bind_loopback(p).await.unwrap();
         assert_ne!(listener.local_addr().unwrap().port(), p);
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_requires_auth() {
+        let (port, token, _sessions) = start_server_with_sessions().await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/session/heartbeat"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/session/heartbeat"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_and_close() {
+        let (port, token, sessions) = start_server_with_sessions().await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/session/heartbeat"))
+            .bearer_auth(&token)
+            .header(SESSION_HEADER, "s1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        assert_eq!(sessions.active(), 1);
+
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/session/close"))
+            .bearer_auth(&token)
+            .header(SESSION_HEADER, "s1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+        assert_eq!(sessions.active(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_mcp_touches_session() {
+        let (port, token, sessions) = start_server_with_sessions().await;
+        let client = reqwest::Client::new();
+        client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .bearer_auth(&token)
+            .header(SESSION_HEADER, "s1")
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sessions.active(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_health_reports_sessions() {
+        let (port, token, _sessions) = start_server_with_sessions().await;
+        let client = reqwest::Client::new();
+        client
+            .post(format!("http://127.0.0.1:{port}/session/heartbeat"))
+            .bearer_auth(&token)
+            .header(SESSION_HEADER, "s1")
+            .send()
+            .await
+            .unwrap();
+
+        let resp: serde_json::Value = client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(resp["sessions"], 1);
     }
 }

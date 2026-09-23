@@ -42,6 +42,23 @@ pub async fn fetch_identity(
     Ok(identity)
 }
 
+pub async fn fetch_health(
+    client: &reqwest::Client,
+    state: &ServerState,
+    timeout: Duration,
+) -> Option<serde_json::Value> {
+    let resp = client
+        .get(state.url("/health"))
+        .timeout(timeout)
+        .send()
+        .await
+        .ok()?;
+    if resp.status() != reqwest::StatusCode::OK {
+        return None;
+    }
+    resp.json().await.ok()
+}
+
 pub async fn request_shutdown(client: &reqwest::Client, state: &ServerState) -> bool {
     client
         .post(state.url("/shutdown"))

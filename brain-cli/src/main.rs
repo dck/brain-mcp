@@ -55,11 +55,20 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let default_filter = match &cli.command {
+        Commands::Serve { stdio: false, .. } => "info",
+        _ => "warn",
+    };
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter)),
+        )
         .init();
 
-    let cli = Cli::parse();
     match cli.command {
         Commands::Init => commands::init::run(cli.json).await,
         Commands::Serve { daemonize, stdio } => {

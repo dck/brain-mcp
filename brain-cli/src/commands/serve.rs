@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use tokio::sync::watch;
@@ -12,6 +13,7 @@ use brain_mcp_proto::handler::McpHandler;
 use brain_server::auth::generate_token;
 use brain_server::http::{HttpServer, bind_loopback};
 use brain_server::identity::ServerIdentity;
+use brain_server::lifecycle::{LEASE, REAP_INTERVAL, SessionTracker};
 use brain_server::singleton::{ServerState, Singleton, SingletonError};
 use brain_vault::VaultAdapter;
 
@@ -83,8 +85,7 @@ pub async fn run(
     };
 
     // 6. Shutdown channel
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    drop(shutdown_rx);
+    let (shutdown_tx, _) = watch::channel(false);
 
     // 7. Bind the listener before writing state, so the state file never
     // outlives a port that failed to bind.
@@ -108,24 +109,55 @@ pub async fn run(
         token: token.clone(),
     })?;
 
+    tracing::info!(pid = std::process::id(), port, version = %identity.version, "server listening");
+
     // 8. Signal handling
     let sig_tx = shutdown_tx.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "cannot install SIGTERM handler");
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("received SIGINT, shutting down"),
+            _ = term.recv() => tracing::info!("received SIGTERM, shutting down"),
+        }
         let _ = sig_tx.send(true);
     });
 
+    let sessions = SessionTracker::new(
+        LEASE,
+        Duration::from_secs(config.server.grace_period_seconds),
+        shutdown_tx.clone(),
+    );
+    sessions.spawn_reaper(REAP_INTERVAL);
+
     // 9. Build handler + server
     let handler = Arc::new(McpHandler::new(service));
-    let server = HttpServer::new(handler, identity, token, shutdown_tx);
+    let server = HttpServer::new(handler, identity, token, shutdown_tx.clone(), sessions);
 
     println!("{}", output::success(&format!("Listening on {url}")));
 
-    // 10. Run (blocks until shutdown)
-    server.serve(listener).await?;
+    // 10. Run (blocks until shutdown, draining in-flight requests for up to 10s)
+    const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+    let mut stop_rx = shutdown_tx.subscribe();
+    let serve = server.serve(listener);
+    tokio::pin!(serve);
+    tokio::select! {
+        r = &mut serve => r?,
+        _ = async {
+            let _ = stop_rx.wait_for(|v| *v).await;
+            tokio::time::sleep(DRAIN_TIMEOUT).await;
+        } => tracing::warn!("in-flight requests did not finish within 10s; exiting"),
+    }
 
     // Singleton dropped here, releasing lock + removing state file
     drop(singleton);
+    tracing::info!("server stopped");
     println!("{}", output::success("Server stopped"));
     Ok(())
 }

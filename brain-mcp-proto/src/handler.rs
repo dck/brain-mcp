@@ -80,7 +80,10 @@ impl McpHandler {
         match result {
             Ok(value) => Response::success(request.id, value),
             Err(ToolError::InvalidParams(msg)) => Response::error(request.id, INVALID_PARAMS, msg),
-            Err(ToolError::Failed(e)) => Response::success(request.id, tool_error(e.to_string())),
+            Err(ToolError::Failed(e)) => {
+                tracing::warn!(tool = name, error = %e, "tool call failed");
+                Response::success(request.id, tool_error(e.to_string()))
+            }
         }
     }
 
