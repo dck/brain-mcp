@@ -74,6 +74,18 @@ impl Singleton {
         file.read_to_string(&mut buf).ok()?;
         toml::from_str(&buf).ok()
     }
+
+    /// Read server state only if a live process holds the lock.
+    ///
+    /// Returns `None` for a state file left behind by a server that died
+    /// without cleanup (crash, SIGKILL, reboot).
+    pub fn read_live_state(state_dir: &Path) -> Option<ServerState> {
+        let file = fs::File::open(state_dir.join("brain-mcp.state")).ok()?;
+        if file.try_lock_shared().is_ok() {
+            return None;
+        }
+        Self::read_state(state_dir)
+    }
 }
 
 impl Drop for Singleton {
@@ -127,5 +139,35 @@ mod tests {
         }
         let s2 = Singleton::acquire(dir.path());
         assert!(s2.is_ok(), "expected Ok after drop, got {s2:?}");
+    }
+
+    #[test]
+    fn test_read_live_state_while_held() {
+        let dir = temp_dir();
+        let s1 = Singleton::acquire(dir.path()).unwrap();
+        s1.write_state(&ServerState {
+            pid: std::process::id(),
+            http: "http://127.0.0.1:4321".into(),
+            started_at: Utc::now(),
+        })
+        .unwrap();
+
+        let state = Singleton::read_live_state(dir.path()).expect("live state");
+        assert_eq!(state.http, "http://127.0.0.1:4321");
+    }
+
+    #[test]
+    fn test_read_live_state_ignores_stale_file() {
+        let dir = temp_dir();
+        let path = dir.path().join("brain-mcp.state");
+        fs::write(
+            &path,
+            "pid = 21153\nhttp = \"http://127.0.0.1:47200/mcp\"\nstarted_at = \"2026-08-09T05:00:21Z\"\n",
+        )
+        .unwrap();
+
+        assert!(Singleton::read_state(dir.path()).is_some());
+        assert!(Singleton::read_live_state(dir.path()).is_none());
+        assert!(Singleton::acquire(dir.path()).is_ok());
     }
 }

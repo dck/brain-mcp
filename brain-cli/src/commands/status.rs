@@ -8,7 +8,7 @@ use crate::output;
 
 pub async fn run(json: bool) -> anyhow::Result<()> {
     let version = env!("CARGO_PKG_VERSION");
-    let state = Singleton::read_state(&state_dir());
+    let state = Singleton::read_live_state(&state_dir());
 
     if json {
         let value = match &state {

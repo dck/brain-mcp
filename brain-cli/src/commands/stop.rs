@@ -4,7 +4,7 @@ use super::state_dir;
 use crate::output;
 
 pub async fn run() -> anyhow::Result<()> {
-    let state = Singleton::read_state(&state_dir());
+    let state = Singleton::read_live_state(&state_dir());
 
     match state {
         Some(s) => {

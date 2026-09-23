@@ -15,7 +15,7 @@ use crate::output;
 
 pub async fn run(config_path: Option<PathBuf>, json_output: bool) -> anyhow::Result<()> {
     // Check if a server is already running — if so, POST to it.
-    let state = Singleton::read_state(&state_dir());
+    let state = Singleton::read_live_state(&state_dir());
 
     if let Some(state) = state {
         return reindex_via_server(&state.http, json_output).await;
