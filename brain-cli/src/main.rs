@@ -69,7 +69,7 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let default_filter = match &cli.command {
-        Commands::Serve { stdio: false } => "info",
+        Commands::Serve { stdio: false } => "info,ort=warn",
         _ => "warn",
     };
     tracing_subscriber::fmt()
