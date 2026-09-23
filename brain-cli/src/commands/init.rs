@@ -80,6 +80,24 @@ const CONCEPT_TEMPLATE: &str = r#"## Definition
 
 "#;
 
+#[cfg(feature = "local-embeddings")]
+const MINILM_REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";
+#[cfg(feature = "local-embeddings")]
+const MINILM_REVISION: &str = "c9745ed1d9f207416be6d2e6f8de32d1f16199bf";
+#[cfg(feature = "local-embeddings")]
+const MINILM_FILES: &[(&str, &str, &str)] = &[
+    (
+        "onnx/model.onnx",
+        "model.onnx",
+        "6fd5d72fe4589f189f8ebc006442dbb529bb7ce38f8082112682524616046452",
+    ),
+    (
+        "tokenizer.json",
+        "tokenizer.json",
+        "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037",
+    ),
+];
+
 pub async fn run(json_output: bool) -> anyhow::Result<()> {
     if json_output {
         anyhow::bail!("init requires interactive input and cannot be used with --json");
@@ -158,8 +176,9 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
     providers.push("Local ONNX (all-MiniLM-L6-v2, ~90MB download)".to_string());
 
     #[cfg(not(feature = "local-embeddings"))]
-    providers
-        .push("Local ONNX (not available — rebuild with --features local-embeddings)".to_string());
+    providers.push(
+        "Local ONNX (not available — this build has no local-embeddings feature)".to_string(),
+    );
 
     let default_provider_idx = match def_provider {
         "onnx" => 1,
@@ -183,27 +202,12 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
             let model_dir = config_dir().join("models/all-MiniLM-L6-v2");
             std::fs::create_dir_all(&model_dir)?;
 
-            let model_path = model_dir.join("model.onnx");
-            let tokenizer_path = model_dir.join("tokenizer.json");
-
-            if !model_path.exists() {
-                download_file(
-                    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx",
-                    &model_path,
-                    "Downloading model.onnx",
-                ).await?;
-            } else {
-                println!("{}", output::success("model.onnx already downloaded"));
-            }
-
-            if !tokenizer_path.exists() {
-                download_file(
-                    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json",
-                    &tokenizer_path,
-                    "Downloading tokenizer.json",
-                ).await?;
-            } else {
-                println!("{}", output::success("tokenizer.json already downloaded"));
+            let client = reqwest::Client::new();
+            for (remote, local, sha256) in MINILM_FILES {
+                let url = format!(
+                    "https://huggingface.co/{MINILM_REPO}/resolve/{MINILM_REVISION}/{remote}"
+                );
+                ensure_model_file(&client, &url, &model_dir.join(local), sha256, local).await?;
             }
 
             (
@@ -215,8 +219,8 @@ pub async fn run(json_output: bool) -> anyhow::Result<()> {
         }
         #[cfg(not(feature = "local-embeddings"))]
         1 => {
-            eprintln!("  ONNX support not compiled in. Rebuild with:");
-            eprintln!("    cargo install --path brain-cli --features local-embeddings");
+            eprintln!("  ONNX support not compiled in. Reinstall with default features:");
+            eprintln!("    cargo install --path brain-cli");
             std::process::exit(1);
         }
         _ => unreachable!(),
@@ -347,36 +351,253 @@ fn load_existing_config() -> Option<Config> {
 }
 
 #[cfg(feature = "local-embeddings")]
-async fn download_file(url: &str, dest: &std::path::Path, label: &str) -> anyhow::Result<()> {
+async fn ensure_model_file(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &std::path::Path,
+    sha256: &str,
+    label: &str,
+) -> anyhow::Result<()> {
+    if dest.exists() {
+        if sha256_file(dest)? == sha256 {
+            println!(
+                "{}",
+                output::success(&format!("{label} already downloaded (checksum ok)"))
+            );
+            return Ok(());
+        }
+        println!(
+            "{}",
+            output::error(&format!("{label} checksum mismatch, downloading again"))
+        );
+    }
+    download_verified(client, url, dest, sha256, label).await
+}
+
+#[cfg(feature = "local-embeddings")]
+async fn download_verified(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &std::path::Path,
+    sha256: &str,
+    label: &str,
+) -> anyhow::Result<()> {
     use futures_util::StreamExt;
     use indicatif::{ProgressBar, ProgressStyle};
     use tokio::io::AsyncWriteExt;
 
-    let client = reqwest::Client::new();
-    let resp = client.get(url).send().await?;
+    let part = dest.with_file_name(format!(
+        "{}.part",
+        dest.file_name().unwrap().to_string_lossy()
+    ));
 
-    if !resp.status().is_success() {
-        anyhow::bail!("Download failed: HTTP {}", resp.status());
+    let result: anyhow::Result<()> = async {
+        let resp = client.get(url).send().await?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Download failed: HTTP {}", resp.status());
+        }
+
+        let total_size = resp.content_length().unwrap_or(0);
+        let pb = ProgressBar::new(total_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("  {msg} [{bar:30}] {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("=> "),
+        );
+        pb.set_message(label.to_string());
+
+        let mut file = tokio::fs::File::create(&part).await?;
+        let mut hasher = hmac_sha256::Hash::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            file.write_all(&chunk).await?;
+            hasher.update(&chunk);
+            pb.inc(chunk.len() as u64);
+        }
+        file.flush().await?;
+        pb.finish_with_message(format!("{label} done"));
+
+        let actual = to_hex(&hasher.finalize());
+        if actual != sha256 {
+            std::fs::remove_file(&part)?;
+            anyhow::bail!("Checksum mismatch for {label}: expected {sha256}, got {actual}");
+        }
+
+        std::fs::rename(&part, dest)?;
+        Ok(())
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    result
+}
+
+#[cfg(feature = "local-embeddings")]
+fn sha256_file(path: &std::path::Path) -> anyhow::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = hmac_sha256::Hash::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(to_hex(&hasher.finalize()))
+}
+
+#[cfg(feature = "local-embeddings")]
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(all(test, feature = "local-embeddings"))]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    #[tokio::test]
+    async fn download_verified_writes_file_on_matching_hash() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/f"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("hello"))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f");
+        let client = reqwest::Client::new();
+        download_verified(
+            &client,
+            &format!("{}/f", server.uri()),
+            &dest,
+            HELLO_SHA256,
+            "f",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "hello");
+        assert!(!dest.with_file_name("f.part").exists());
     }
 
-    let total_size = resp.content_length().unwrap_or(0);
-    let pb = ProgressBar::new(total_size);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("  {msg} [{bar:30}] {bytes}/{total_bytes} ({eta})")
-            .unwrap()
-            .progress_chars("=> "),
-    );
-    pb.set_message(label.to_string());
+    #[tokio::test]
+    async fn download_verified_rejects_bad_hash() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/f"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("hello"))
+            .mount(&server)
+            .await;
 
-    let mut file = tokio::fs::File::create(dest).await?;
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        file.write_all(&chunk).await?;
-        pb.inc(chunk.len() as u64);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f");
+        let client = reqwest::Client::new();
+        let err = download_verified(&client, &format!("{}/f", server.uri()), &dest, "00", "f")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Checksum mismatch"));
+        assert!(!dest.exists());
+        assert!(!dest.with_file_name("f.part").exists());
     }
-    file.flush().await?;
-    pb.finish_with_message(format!("{label} done"));
-    Ok(())
+
+    #[tokio::test]
+    async fn download_verified_http_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/f"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f");
+        let client = reqwest::Client::new();
+        let result = download_verified(
+            &client,
+            &format!("{}/f", server.uri()),
+            &dest,
+            HELLO_SHA256,
+            "f",
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!dest.exists());
+        assert!(!dest.with_file_name("f.part").exists());
+    }
+
+    #[tokio::test]
+    async fn ensure_model_file_skips_verified_existing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/f"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("hello"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f");
+        std::fs::write(&dest, "hello").unwrap();
+        let client = reqwest::Client::new();
+        ensure_model_file(
+            &client,
+            &format!("{}/f", server.uri()),
+            &dest,
+            HELLO_SHA256,
+            "f",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn ensure_model_file_replaces_corrupt_existing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/f"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("hello"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f");
+        std::fs::write(&dest, "garbage").unwrap();
+        let client = reqwest::Client::new();
+        ensure_model_file(
+            &client,
+            &format!("{}/f", server.uri()),
+            &dest,
+            HELLO_SHA256,
+            "f",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "hello");
+    }
+
+    #[test]
+    fn sha256_file_matches_known_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, "hello").unwrap();
+        assert_eq!(sha256_file(&path).unwrap(), HELLO_SHA256);
+    }
 }

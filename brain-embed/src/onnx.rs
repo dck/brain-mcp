@@ -20,6 +20,15 @@ impl OnnxEmbedder {
         let model_path = model_dir.join("model.onnx");
         let tokenizer_path = model_dir.join("tokenizer.json");
 
+        for path in [&model_path, &tokenizer_path] {
+            if !path.is_file() {
+                anyhow::bail!(
+                    "ONNX model file not found: {}. Run 'brain-mcp init' and choose Local ONNX to download it.",
+                    path.display()
+                );
+            }
+        }
+
         let session = Session::builder()
             .map_err(|e| anyhow::anyhow!("Failed to create session builder: {e}"))?
             .with_intra_threads(1)

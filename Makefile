@@ -4,10 +4,10 @@ build:
 	cargo build --workspace
 
 release:
-	cargo build --release --features local-embeddings
+	cargo build --release
 
 install: release
-	cargo install --path brain-cli --features local-embeddings
+	cargo install --path brain-cli
 
 uninstall:
 	cargo uninstall brain-cli

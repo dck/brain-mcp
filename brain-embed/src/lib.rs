@@ -45,9 +45,61 @@ pub fn create_embedder(config: &EmbeddingConfig) -> Result<Arc<dyn EmbeddingPort
         #[cfg(not(feature = "local-embeddings"))]
         "onnx" => {
             anyhow::bail!(
-                "ONNX support not compiled in. Rebuild with: cargo install --path brain-cli --features local-embeddings"
+                "provider = \"onnx\" needs local embeddings, but this brain-mcp was built without the local-embeddings feature. Reinstall with default features (cargo install --path brain-cli, or make install), or set provider = \"openai\"."
             )
         }
         other => anyhow::bail!("unknown embedding provider: {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(provider: &str, model_path: Option<String>) -> EmbeddingConfig {
+        EmbeddingConfig {
+            provider: provider.into(),
+            model: "all-MiniLM-L6-v2".into(),
+            api_key_env: None,
+            model_path,
+        }
+    }
+
+    #[cfg(not(feature = "local-embeddings"))]
+    #[test]
+    fn onnx_without_feature_explains_reinstall() {
+        let err = match create_embedder(&config("onnx", Some("/nonexistent".into()))) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("built without the local-embeddings feature"));
+        assert!(msg.contains("cargo install --path brain-cli"));
+    }
+
+    #[cfg(feature = "local-embeddings")]
+    #[test]
+    fn onnx_missing_model_files_point_to_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = match create_embedder(&config(
+            "onnx",
+            Some(dir.path().to_string_lossy().into_owned()),
+        )) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("ONNX model file not found"));
+        assert!(msg.contains("model.onnx"));
+        assert!(msg.contains("brain-mcp init"));
+    }
+
+    #[test]
+    fn unknown_provider_is_rejected() {
+        let err = match create_embedder(&config("foo", None)) {
+            Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("unknown embedding provider: foo"));
     }
 }

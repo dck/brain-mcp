@@ -38,8 +38,8 @@ Claude Code Session 3 ──┘        (one per session)       (singleton)
 
 ### Prerequisites
 
-- Rust toolchain (1.75+)
-- For local embeddings: no additional requirements (ONNX model downloaded during setup)
+- Rust toolchain (edition 2024, Rust 1.88+)
+- Network access on the first build: the ONNX Runtime binaries are downloaded by the `ort` crate
 - For OpenAI embeddings: an API key
 
 ### Build and install
@@ -47,10 +47,11 @@ Claude Code Session 3 ──┘        (one per session)       (singleton)
 ```bash
 git clone https://github.com/dck/brain-mcp.git
 cd brain-mcp
-make install
+make install        # same as: cargo install --path brain-cli
 ```
 
-This builds with local ONNX embedding support and installs the `brain-mcp` binary to `~/.cargo/bin/`.
+Local ONNX embeddings are built in by default. For an OpenAI-only binary without ONNX Runtime:
+`cargo install --path brain-cli --no-default-features`.
 
 ### First-time setup
 
