@@ -119,8 +119,8 @@ async fn run_stdio(_config_path: Option<PathBuf>) -> anyhow::Result<()> {
         Some(state) => state,
         None => {
             eprintln!("Starting brain-mcp server...");
-            spawn_server()?;
-            wait_for_server(&state_dir, Duration::from_secs(30)).await?
+            let mut child = spawn_server()?;
+            wait_for_server(&state_dir, &mut child, Duration::from_secs(30)).await?
         }
     };
 
@@ -156,11 +156,11 @@ async fn read_existing_state(state_dir: &Path) -> Option<ServerState> {
     if ok { Some(state) } else { None }
 }
 
-fn spawn_server() -> anyhow::Result<()> {
+fn spawn_server() -> anyhow::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
 
     let exe = std::env::current_exe()?;
-    unsafe {
+    let child = unsafe {
         std::process::Command::new(exe)
             .arg("serve")
             .stdin(std::process::Stdio::null())
@@ -170,12 +170,16 @@ fn spawn_server() -> anyhow::Result<()> {
                 libc::setsid();
                 Ok(())
             })
-            .spawn()?;
-    }
-    Ok(())
+            .spawn()?
+    };
+    Ok(child)
 }
 
-async fn wait_for_server(state_dir: &Path, timeout: Duration) -> anyhow::Result<ServerState> {
+async fn wait_for_server(
+    state_dir: &Path,
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> anyhow::Result<ServerState> {
     let start = Instant::now();
     loop {
         if let Some(state) = Singleton::read_state(state_dir) {
@@ -194,6 +198,11 @@ async fn wait_for_server(state_dir: &Path, timeout: Duration) -> anyhow::Result<
             {
                 return Ok(state);
             }
+        }
+        if let Some(status) = child.try_wait()?
+            && !status.success()
+        {
+            anyhow::bail!("Server exited during startup ({status})");
         }
         if start.elapsed() > timeout {
             anyhow::bail!("Timeout waiting for server to start");
