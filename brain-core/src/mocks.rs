@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
+use chrono::{DateTime, Utc};
+
 use crate::error::Result;
-use crate::model::{Filter, IndexEntry, Memory, Metadata, SearchResult};
-use crate::ports::{BoxFuture, EmbeddingPort, IndexPort, VaultPort};
+use crate::model::{
+    Filter, IndexEntry, Memory, Metadata, SearchLogEntry, SearchResult, StoreLogEntry,
+};
+use crate::ports::{BoxFuture, EmbeddingPort, IndexPort, LogPort, VaultPort};
 
 // ---------------------------------------------------------------------------
 // MockVault
@@ -249,6 +253,82 @@ impl IndexPort for MockIndex {
         Box::pin(async move {
             *self.model_id.lock().unwrap() = Some(model_id);
             Ok(())
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MockLog
+// ---------------------------------------------------------------------------
+
+pub struct MockLog {
+    searches: Mutex<Vec<SearchLogEntry>>,
+    stores: Mutex<Vec<StoreLogEntry>>,
+}
+
+impl MockLog {
+    pub fn new() -> Self {
+        Self {
+            searches: Mutex::new(Vec::new()),
+            stores: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn searches(&self) -> Vec<SearchLogEntry> {
+        self.searches.lock().unwrap().clone()
+    }
+
+    pub fn stores(&self) -> Vec<StoreLogEntry> {
+        self.stores.lock().unwrap().clone()
+    }
+}
+
+impl Default for MockLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LogPort for MockLog {
+    fn log_search(&self, entry: &SearchLogEntry) -> BoxFuture<'_, Result<()>> {
+        let entry = entry.clone();
+        Box::pin(async move {
+            self.searches.lock().unwrap().push(entry);
+            Ok(())
+        })
+    }
+
+    fn log_store(&self, entry: &StoreLogEntry) -> BoxFuture<'_, Result<()>> {
+        let entry = entry.clone();
+        Box::pin(async move {
+            self.stores.lock().unwrap().push(entry);
+            Ok(())
+        })
+    }
+
+    fn searches_since(&self, since: DateTime<Utc>) -> BoxFuture<'_, Result<Vec<SearchLogEntry>>> {
+        Box::pin(async move {
+            Ok(self
+                .searches
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.ts >= since)
+                .cloned()
+                .collect())
+        })
+    }
+
+    fn stores_since(&self, since: DateTime<Utc>) -> BoxFuture<'_, Result<Vec<StoreLogEntry>>> {
+        Box::pin(async move {
+            Ok(self
+                .stores
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.ts >= since)
+                .cloned()
+                .collect())
         })
     }
 }

@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +9,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response as HttpResponse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use brain_core::model::CallContext;
 use brain_mcp_proto::handler::McpHandler;
 use brain_mcp_proto::jsonrpc::{INVALID_REQUEST, PARSE_ERROR, Request, Response};
 use serde_json::json;
@@ -16,6 +18,26 @@ use tokio::sync::watch;
 use crate::auth;
 use crate::identity::ServerIdentity;
 use crate::lifecycle::{LEASE, SESSION_HEADER, SessionTracker};
+
+pub const CLIENT_HEADER: &str = "x-brain-client";
+pub const CWD_HEADER: &str = "x-brain-cwd";
+const MAX_HEADER_CHARS: usize = 256;
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let v = headers.get(name)?.to_str().ok()?.trim();
+    if v.is_empty() {
+        return None;
+    }
+    Some(v.chars().take(MAX_HEADER_CHARS).collect())
+}
+
+pub fn call_context(headers: &HeaderMap) -> CallContext {
+    CallContext {
+        client: header_value(headers, CLIENT_HEADER),
+        session_id: header_value(headers, SESSION_HEADER),
+        cwd: header_value(headers, CWD_HEADER).map(PathBuf::from),
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -159,7 +181,8 @@ async fn handle_mcp(State(s): State<AppState>, headers: HeaderMap, body: Bytes) 
     if is_notification {
         return StatusCode::ACCEPTED.into_response();
     }
-    Json(s.handler.handle(request).await).into_response()
+    let ctx = call_context(&headers);
+    Json(s.handler.handle(request, &ctx).await).into_response()
 }
 
 async fn handle_shutdown(State(s): State<AppState>, headers: HeaderMap) -> HttpResponse {
@@ -589,5 +612,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp["sessions"], 1);
+    }
+
+    #[test]
+    fn call_context_reads_trims_and_truncates() {
+        let long_cwd = "a".repeat(300);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-brain-client", " claude-code ".parse().unwrap());
+        headers.insert("X-Brain-Session", "abc".parse().unwrap());
+        headers.insert("x-brain-cwd", long_cwd.parse().unwrap());
+
+        let ctx = call_context(&headers);
+        assert_eq!(ctx.client.as_deref(), Some("claude-code"));
+        assert_eq!(ctx.session_id.as_deref(), Some("abc"));
+        assert_eq!(ctx.cwd.unwrap().as_os_str().len(), 256);
+
+        let ctx = call_context(&HeaderMap::new());
+        assert_eq!(ctx.client, None);
+        assert_eq!(ctx.session_id, None);
+        assert_eq!(ctx.cwd, None);
     }
 }

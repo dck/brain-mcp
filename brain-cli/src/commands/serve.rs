@@ -48,9 +48,10 @@ pub async fn run(config_path: Option<PathBuf>, stdio: bool) -> anyhow::Result<()
 
     // 3. Build service
     let service = Arc::new(
-        MemoryService::new(vault, embedder.clone(), index)
+        MemoryService::new(vault, embedder.clone(), index.clone())
             .with_min_score(config.search.min_score)
-            .with_categories(config.vault.categories.clone()),
+            .with_categories(config.vault.categories.clone())
+            .with_log(index),
     );
 
     // 4. Check model compatibility

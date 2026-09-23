@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -53,12 +54,80 @@ pub struct IndexEntry {
     pub metadata: Metadata,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Filter {
     pub tags: Option<Vec<String>>,
     pub category: Option<String>,
     pub project: Option<String>,
     pub since: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CallContext {
+    pub client: Option<String>,
+    pub session_id: Option<String>,
+    pub cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoggedHit {
+    pub id: String,
+    pub rank: usize,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchLogEntry {
+    pub ts: DateTime<Utc>,
+    pub ctx: CallContext,
+    pub project: Option<String>,
+    pub query: String,
+    pub filter: Filter,
+    pub limit: usize,
+    pub results: Vec<LoggedHit>,
+    pub latency_ms: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreOutcome {
+    Stored,
+    DuplicateRejected,
+    IdConflict,
+    Error,
+}
+
+impl StoreOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StoreOutcome::Stored => "stored",
+            StoreOutcome::DuplicateRejected => "duplicate_rejected",
+            StoreOutcome::IdConflict => "id_conflict",
+            StoreOutcome::Error => "error",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "stored" => Some(StoreOutcome::Stored),
+            "duplicate_rejected" => Some(StoreOutcome::DuplicateRejected),
+            "id_conflict" => Some(StoreOutcome::IdConflict),
+            "error" => Some(StoreOutcome::Error),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoreLogEntry {
+    pub ts: DateTime<Utc>,
+    pub ctx: CallContext,
+    pub memory_id: Option<String>,
+    pub outcome: StoreOutcome,
+    pub forced: bool,
+    pub neighbors: Vec<LoggedHit>,
+    pub error: Option<String>,
 }
 
 #[cfg(test)]

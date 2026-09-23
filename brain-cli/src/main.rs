@@ -51,6 +51,18 @@ enum Commands {
     Stop,
     /// Full reindex of the vault
     Reindex,
+    /// Show search/store usage statistics from the local log
+    Stats {
+        /// Window size in days
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+        /// Top score below this marks a search as weak
+        #[arg(long, default_value_t = 0.45)]
+        weak: f32,
+        /// Number of top retrieved memories to show
+        #[arg(long, default_value_t = 10)]
+        top: usize,
+    },
 }
 
 #[tokio::main]
@@ -78,5 +90,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Status => commands::status::run(cli.json).await,
         Commands::Stop => commands::stop::run().await,
         Commands::Reindex => commands::reindex::run(cli.config, cli.json).await,
+        Commands::Stats { days, weak, top } => {
+            commands::stats::run(cli.config, days, weak, top, cli.json).await
+        }
     }
 }

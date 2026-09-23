@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use brain_core::ports::LogPort;
+use chrono::Utc;
 use serde_json::json;
 
 async fn mcp_call(
@@ -201,5 +203,85 @@ async fn full_roundtrip() {
     assert!(reindex_text.contains("\"reindexed\":0"));
 
     // Shutdown server
+    let _ = shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn search_log_records_caller_headers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vault = Arc::new(brain_vault::adapter::VaultAdapter::new(
+        tmp.path().to_path_buf(),
+        "_templates".into(),
+    ));
+    let embedder = Arc::new(brain_core::mocks::MockEmbedder::new(8));
+    let index = Arc::new(brain_index::adapter::SqliteVecIndex::open_in_memory().unwrap());
+    let service = Arc::new(
+        brain_core::service::MemoryService::new(vault, embedder, index.clone())
+            .with_log(index.clone()),
+    );
+    let handler = Arc::new(brain_mcp_proto::handler::McpHandler::new(service));
+
+    let token = brain_server::auth::generate_token();
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+    let port = brain_server::http::run_on_random_port(handler, token.clone(), shutdown_tx.clone())
+        .await
+        .unwrap();
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let client = reqwest::Client::new();
+
+    tool_call(
+        &client,
+        &url,
+        &token,
+        "memory_store",
+        json!({
+            "title": "Caller Headers",
+            "content": "Some content for header propagation",
+            "tags": []
+        }),
+    )
+    .await;
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .header("X-Brain-Client", "e2e")
+        .header("X-Brain-Session", "sess-1")
+        .header("X-Brain-Cwd", "/tmp/proj")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "memory_search",
+                "arguments": { "query": "header propagation" }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let searches = index
+        .searches_since(Utc::now() - chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(searches.len(), 1);
+    assert_eq!(searches[0].ctx.client.as_deref(), Some("e2e"));
+    assert_eq!(searches[0].ctx.session_id.as_deref(), Some("sess-1"));
+    assert_eq!(
+        searches[0].ctx.cwd.as_deref(),
+        Some(std::path::Path::new("/tmp/proj"))
+    );
+    assert_eq!(searches[0].results.len(), 1);
+
+    let stores = index
+        .stores_since(Utc::now() - chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores[0].outcome, brain_core::model::StoreOutcome::Stored);
+    assert_eq!(stores[0].ctx.client, None);
+
     let _ = shutdown_tx.send(true);
 }

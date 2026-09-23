@@ -1,8 +1,12 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use chrono::{DateTime, Utc};
+
 use crate::error::Result;
-use crate::model::{Filter, IndexEntry, Memory, Metadata, SearchResult};
+use crate::model::{
+    Filter, IndexEntry, Memory, Metadata, SearchLogEntry, SearchResult, StoreLogEntry,
+};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -34,4 +38,11 @@ pub trait IndexPort: Send + Sync {
     fn rebuild(&self, entries: Vec<IndexEntry>, model_id: &str) -> BoxFuture<'_, Result<()>>;
     fn stored_model_id(&self) -> BoxFuture<'_, Result<Option<String>>>;
     fn set_model_id(&self, model_id: &str) -> BoxFuture<'_, Result<()>>;
+}
+
+pub trait LogPort: Send + Sync {
+    fn log_search(&self, entry: &SearchLogEntry) -> BoxFuture<'_, Result<()>>;
+    fn log_store(&self, entry: &StoreLogEntry) -> BoxFuture<'_, Result<()>>;
+    fn searches_since(&self, since: DateTime<Utc>) -> BoxFuture<'_, Result<Vec<SearchLogEntry>>>;
+    fn stores_since(&self, since: DateTime<Utc>) -> BoxFuture<'_, Result<Vec<StoreLogEntry>>>;
 }

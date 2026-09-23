@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -8,8 +8,11 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use brain_core::error::{BrainError, Result};
-use brain_core::model::{Filter, IndexEntry, Memory, Metadata, SearchResult};
-use brain_core::ports::{BoxFuture, IndexPort};
+use brain_core::model::{
+    CallContext, Filter, IndexEntry, LoggedHit, Memory, Metadata, SearchLogEntry, SearchResult,
+    StoreLogEntry, StoreOutcome,
+};
+use brain_core::ports::{BoxFuture, IndexPort, LogPort};
 
 pub struct SqliteVecIndex {
     conn: Mutex<Connection>,
@@ -50,9 +53,42 @@ const MIGRATION_1_SQL: &str = "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY
          embedding BLOB NOT NULL
      );";
 
+const LOG_TABLES_SQL: &str = "CREATE TABLE search_log (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    client TEXT,
+    session_id TEXT,
+    cwd TEXT,
+    project TEXT,
+    query TEXT NOT NULL,
+    filters TEXT NOT NULL,
+    result_limit INTEGER NOT NULL,
+    results TEXT NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    error TEXT
+);
+CREATE INDEX search_log_ts ON search_log(ts);
+CREATE TABLE store_log (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    client TEXT,
+    session_id TEXT,
+    cwd TEXT,
+    memory_id TEXT,
+    outcome TEXT NOT NULL CHECK (outcome IN ('stored', 'duplicate_rejected', 'id_conflict', 'error')),
+    forced INTEGER NOT NULL DEFAULT 0,
+    neighbors TEXT NOT NULL,
+    error TEXT
+);
+CREATE INDEX store_log_ts ON store_log(ts);";
+
 type Migration = fn(&Transaction<'_>) -> rusqlite::Result<()>;
 
-const MIGRATIONS: &[Migration] = &[migration_1];
+const MIGRATIONS: &[Migration] = &[migration_1, migration_2];
+
+fn migration_2(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(LOG_TABLES_SQL)
+}
 
 fn migration_1(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute_batch(MIGRATION_1_SQL)?;
@@ -415,6 +451,266 @@ impl IndexPort for SqliteVecIndex {
     }
 }
 
+fn cwd_to_string(cwd: Option<&PathBuf>) -> Option<String> {
+    cwd.map(|p| p.to_string_lossy().into_owned())
+}
+
+impl LogPort for SqliteVecIndex {
+    fn log_search(&self, entry: &SearchLogEntry) -> BoxFuture<'_, Result<()>> {
+        let entry = entry.clone();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let ts = entry
+                .ts
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let filters = serde_json::to_string(&entry.filter)
+                .map_err(|e| BrainError::Index(e.to_string()))?;
+            let results = serde_json::to_string(&entry.results)
+                .map_err(|e| BrainError::Index(e.to_string()))?;
+            conn.execute(
+                "INSERT INTO search_log (ts, client, session_id, cwd, project, query, filters, result_limit, results, latency_ms, error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    ts,
+                    entry.ctx.client,
+                    entry.ctx.session_id,
+                    cwd_to_string(entry.ctx.cwd.as_ref()),
+                    entry.project,
+                    entry.query,
+                    filters,
+                    entry.limit as i64,
+                    results,
+                    entry.latency_ms as i64,
+                    entry.error,
+                ],
+            )
+            .map_err(|e| BrainError::Index(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn log_store(&self, entry: &StoreLogEntry) -> BoxFuture<'_, Result<()>> {
+        let entry = entry.clone();
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let ts = entry
+                .ts
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let neighbors = serde_json::to_string(&entry.neighbors)
+                .map_err(|e| BrainError::Index(e.to_string()))?;
+            conn.execute(
+                "INSERT INTO store_log (ts, client, session_id, cwd, memory_id, outcome, forced, neighbors, error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    ts,
+                    entry.ctx.client,
+                    entry.ctx.session_id,
+                    cwd_to_string(entry.ctx.cwd.as_ref()),
+                    entry.memory_id,
+                    entry.outcome.as_str(),
+                    entry.forced as i64,
+                    neighbors,
+                    entry.error,
+                ],
+            )
+            .map_err(|e| BrainError::Index(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn searches_since(&self, since: DateTime<Utc>) -> BoxFuture<'_, Result<Vec<SearchLogEntry>>> {
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let since_str = since.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let mut stmt = conn
+                .prepare(
+                    "SELECT ts, client, session_id, cwd, project, query, filters, result_limit, results, latency_ms, error
+                     FROM search_log WHERE ts >= ?1 ORDER BY seq",
+                )
+                .map_err(|e| BrainError::Index(e.to_string()))?;
+            #[allow(clippy::type_complexity)]
+            let rows: Vec<
+                rusqlite::Result<(
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    String,
+                    i64,
+                    String,
+                    i64,
+                    Option<String>,
+                )>,
+            > = stmt
+                .query_map([since_str], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    ))
+                })
+                .map_err(|e| BrainError::Index(e.to_string()))?
+                .collect();
+
+            let mut out = Vec::new();
+            for row in rows {
+                let (
+                    ts,
+                    client,
+                    session_id,
+                    cwd,
+                    project,
+                    query,
+                    filters,
+                    limit,
+                    results,
+                    latency_ms,
+                    error,
+                ) = match row {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("skipping search_log row: {e}");
+                        continue;
+                    }
+                };
+                let ts: DateTime<Utc> = match ts.parse() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("skipping search_log row with bad ts: {e}");
+                        continue;
+                    }
+                };
+                let filter: Filter = match serde_json::from_str(&filters) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("skipping search_log row with bad filters: {e}");
+                        continue;
+                    }
+                };
+                let results: Vec<LoggedHit> = match serde_json::from_str(&results) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("skipping search_log row with bad results: {e}");
+                        continue;
+                    }
+                };
+                out.push(SearchLogEntry {
+                    ts,
+                    ctx: CallContext {
+                        client,
+                        session_id,
+                        cwd: cwd.map(PathBuf::from),
+                    },
+                    project,
+                    query,
+                    filter,
+                    limit: limit as usize,
+                    results,
+                    latency_ms: latency_ms as u64,
+                    error,
+                });
+            }
+            Ok(out)
+        })
+    }
+
+    fn stores_since(&self, since: DateTime<Utc>) -> BoxFuture<'_, Result<Vec<StoreLogEntry>>> {
+        Box::pin(async move {
+            let conn = self.conn.lock().await;
+            let since_str = since.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let mut stmt = conn
+                .prepare(
+                    "SELECT ts, client, session_id, cwd, memory_id, outcome, forced, neighbors, error
+                     FROM store_log WHERE ts >= ?1 ORDER BY seq",
+                )
+                .map_err(|e| BrainError::Index(e.to_string()))?;
+            #[allow(clippy::type_complexity)]
+            let rows: Vec<
+                rusqlite::Result<(
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    i64,
+                    String,
+                    Option<String>,
+                )>,
+            > = stmt
+                .query_map([since_str], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                })
+                .map_err(|e| BrainError::Index(e.to_string()))?
+                .collect();
+
+            let mut out = Vec::new();
+            for row in rows {
+                let (ts, client, session_id, cwd, memory_id, outcome, forced, neighbors, error) =
+                    match row {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("skipping store_log row: {e}");
+                            continue;
+                        }
+                    };
+                let ts: DateTime<Utc> = match ts.parse() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("skipping store_log row with bad ts: {e}");
+                        continue;
+                    }
+                };
+                let Some(outcome) = StoreOutcome::parse(&outcome) else {
+                    warn!("skipping store_log row with unknown outcome: {outcome}");
+                    continue;
+                };
+                let neighbors: Vec<LoggedHit> = match serde_json::from_str(&neighbors) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("skipping store_log row with bad neighbors: {e}");
+                        continue;
+                    }
+                };
+                out.push(StoreLogEntry {
+                    ts,
+                    ctx: CallContext {
+                        client,
+                        session_id,
+                        cwd: cwd.map(PathBuf::from),
+                    },
+                    memory_id,
+                    outcome,
+                    forced: forced != 0,
+                    neighbors,
+                    error,
+                });
+            }
+            Ok(out)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,7 +993,7 @@ mod tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, 1);
+            assert_eq!(version, MIGRATIONS.len() as i64);
             for column in ["access_count", "last_accessed_at"] {
                 let exists = conn
                     .prepare("SELECT 1 FROM pragma_table_info('memories') WHERE name = ?1")
@@ -733,7 +1029,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, MIGRATIONS.len() as i64);
         let access_count: i64 = conn
             .query_row(
                 "SELECT access_count FROM memories WHERE id = 'm1'",
@@ -760,7 +1056,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, MIGRATIONS.len() as i64);
         drop(conn);
         let all = index.list(&Filter::default()).await.unwrap();
         assert_eq!(all.len(), 1);
@@ -932,5 +1228,181 @@ mod tests {
     async fn test_record_access_unknown_id_is_noop() {
         let index = SqliteVecIndex::open_in_memory().unwrap();
         index.record_access(&["nope".to_string()]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_log_tables_created() {
+        let index = SqliteVecIndex::open_in_memory().unwrap();
+        let conn = index.conn.lock().await;
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(tables.contains(&"search_log".to_string()));
+        assert!(tables.contains(&"store_log".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_search_log_roundtrip() {
+        let index = SqliteVecIndex::open_in_memory().unwrap();
+        let ts = Utc::now();
+        let entry = SearchLogEntry {
+            ts,
+            ctx: CallContext {
+                client: Some("claude-code".into()),
+                session_id: Some("s1".into()),
+                cwd: Some("/w/fitlake".into()),
+            },
+            project: Some("fitlake".into()),
+            query: "deploy terraform".into(),
+            filter: Filter {
+                tags: Some(vec!["rust".into()]),
+                ..Filter::default()
+            },
+            limit: 5,
+            results: vec![
+                LoggedHit {
+                    id: "a".into(),
+                    rank: 1,
+                    score: 0.9,
+                },
+                LoggedHit {
+                    id: "b".into(),
+                    rank: 2,
+                    score: 0.5,
+                },
+            ],
+            latency_ms: 12,
+            error: None,
+        };
+        index.log_search(&entry).await.unwrap();
+
+        let results = index
+            .searches_since(ts - chrono::Duration::seconds(1))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        let got = &results[0];
+        let expected_ts = DateTime::from_timestamp_millis(ts.timestamp_millis()).unwrap();
+        assert_eq!(got.ts, expected_ts);
+        assert_eq!(got.ctx, entry.ctx);
+        assert_eq!(got.project, entry.project);
+        assert_eq!(got.query, entry.query);
+        assert_eq!(got.filter, entry.filter);
+        assert_eq!(got.limit, entry.limit);
+        assert_eq!(got.results, entry.results);
+        assert_eq!(got.latency_ms, entry.latency_ms);
+        assert_eq!(got.error, entry.error);
+    }
+
+    #[tokio::test]
+    async fn test_store_log_roundtrip() {
+        let index = SqliteVecIndex::open_in_memory().unwrap();
+        let ts = Utc::now();
+        for outcome in [
+            StoreOutcome::Stored,
+            StoreOutcome::DuplicateRejected,
+            StoreOutcome::IdConflict,
+            StoreOutcome::Error,
+        ] {
+            let entry = StoreLogEntry {
+                ts,
+                ctx: CallContext {
+                    client: Some("claude-code".into()),
+                    session_id: Some("s1".into()),
+                    cwd: Some("/w/fitlake".into()),
+                },
+                memory_id: Some("20260801-x".into()),
+                outcome,
+                forced: outcome == StoreOutcome::Stored,
+                neighbors: vec![LoggedHit {
+                    id: "a".into(),
+                    rank: 1,
+                    score: 0.95,
+                }],
+                error: (outcome == StoreOutcome::Error).then(|| "boom".to_string()),
+            };
+            index.log_store(&entry).await.unwrap();
+
+            let results = index
+                .stores_since(ts - chrono::Duration::seconds(1))
+                .await
+                .unwrap();
+            let got = results.iter().find(|e| e.outcome == outcome).unwrap();
+            assert_eq!(got.ctx, entry.ctx);
+            assert_eq!(got.memory_id, entry.memory_id);
+            assert_eq!(got.forced, entry.forced);
+            assert_eq!(got.neighbors, entry.neighbors);
+            assert_eq!(got.error, entry.error);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_searches_since_filters_by_ts() {
+        let index = SqliteVecIndex::open_in_memory().unwrap();
+        let old = SearchLogEntry {
+            ts: Utc::now() - chrono::Duration::days(10),
+            ctx: CallContext::default(),
+            project: None,
+            query: "old".into(),
+            filter: Filter::default(),
+            limit: 5,
+            results: vec![],
+            latency_ms: 1,
+            error: None,
+        };
+        let recent = SearchLogEntry {
+            ts: Utc::now() - chrono::Duration::days(1),
+            query: "recent".into(),
+            ..old.clone()
+        };
+        index.log_search(&old).await.unwrap();
+        index.log_search(&recent).await.unwrap();
+
+        let results = index
+            .searches_since(Utc::now() - chrono::Duration::days(5))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].query, "recent");
+    }
+
+    #[tokio::test]
+    async fn test_logs_survive_rebuild_and_delete() {
+        let index = SqliteVecIndex::open_in_memory().unwrap();
+        let search_entry = SearchLogEntry {
+            ts: Utc::now(),
+            ctx: CallContext::default(),
+            project: None,
+            query: "q".into(),
+            filter: Filter::default(),
+            limit: 5,
+            results: vec![],
+            latency_ms: 1,
+            error: None,
+        };
+        let store_entry = StoreLogEntry {
+            ts: Utc::now(),
+            ctx: CallContext::default(),
+            memory_id: Some("m1".into()),
+            outcome: StoreOutcome::Stored,
+            forced: false,
+            neighbors: vec![],
+            error: None,
+        };
+        index.log_search(&search_entry).await.unwrap();
+        index.log_store(&store_entry).await.unwrap();
+
+        let meta = make_metadata("m1", "learnings", vec![], None);
+        index.upsert("m1", &[1.0, 0.0, 0.0], &meta).await.unwrap();
+        index.delete("m1").await.unwrap();
+        index.rebuild(vec![], "m").await.unwrap();
+
+        let epoch = DateTime::<Utc>::from_timestamp(0, 0).unwrap();
+        assert_eq!(index.searches_since(epoch).await.unwrap().len(), 1);
+        assert_eq!(index.stores_since(epoch).await.unwrap().len(), 1);
     }
 }

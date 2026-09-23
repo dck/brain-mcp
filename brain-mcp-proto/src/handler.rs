@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use brain_core::error::BrainError;
-use brain_core::model::Filter;
+use brain_core::model::{CallContext, Filter};
 use brain_core::service::MemoryService;
 
 use crate::jsonrpc::{INVALID_PARAMS, METHOD_NOT_FOUND, Request, Response};
@@ -34,7 +34,7 @@ impl McpHandler {
         Self { service }
     }
 
-    pub async fn handle(&self, request: Request) -> Response {
+    pub async fn handle(&self, request: Request, ctx: &CallContext) -> Response {
         match request.method.as_str() {
             "initialize" => {
                 Response::success(request.id, initialize_result(request.params.as_ref()))
@@ -42,7 +42,7 @@ impl McpHandler {
             "ping" => Response::success(request.id, json!({})),
             m if m.starts_with("notifications/") => Response::success(request.id, json!({})),
             "tools/list" => self.handle_tools_list(&request),
-            "tools/call" => self.handle_tools_call(request).await,
+            "tools/call" => self.handle_tools_call(request, ctx).await,
             _ => Response::error(request.id, METHOD_NOT_FOUND, "Method not found"),
         }
     }
@@ -51,7 +51,7 @@ impl McpHandler {
         Response::success(request.id.clone(), json!({ "tools": tool_definitions() }))
     }
 
-    async fn handle_tools_call(&self, request: Request) -> Response {
+    async fn handle_tools_call(&self, request: Request, ctx: &CallContext) -> Response {
         let params = match &request.params {
             Some(p) => p,
             None => return Response::error(request.id, INVALID_PARAMS, "Missing params"),
@@ -68,8 +68,8 @@ impl McpHandler {
             .unwrap_or_else(|| json!({}));
 
         let result = match name {
-            "memory_store" => self.tool_store(&args).await,
-            "memory_search" => self.tool_search(&args).await,
+            "memory_store" => self.tool_store(ctx, &args).await,
+            "memory_search" => self.tool_search(ctx, &args).await,
             "memory_list" => self.tool_list(&args).await,
             "memory_update" => self.tool_update(&args).await,
             "memory_delete" => self.tool_delete(&args).await,
@@ -87,7 +87,11 @@ impl McpHandler {
         }
     }
 
-    async fn tool_store(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
+    async fn tool_store(
+        &self,
+        ctx: &CallContext,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, ToolError> {
         let content = args
             .get("content")
             .and_then(|v| v.as_str())
@@ -115,13 +119,17 @@ impl McpHandler {
 
         let memory = self
             .service
-            .store(title, content, tags, category, project, force)
+            .store_as(ctx, title, content, tags, category, project, force)
             .await?;
 
         Ok(tool_text(serde_json::to_string(&memory).unwrap()))
     }
 
-    async fn tool_search(&self, args: &serde_json::Value) -> Result<serde_json::Value, ToolError> {
+    async fn tool_search(
+        &self,
+        ctx: &CallContext,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, ToolError> {
         let query = args
             .get("query")
             .and_then(|v| v.as_str())
@@ -136,7 +144,7 @@ impl McpHandler {
             ..Default::default()
         };
 
-        let results = self.service.search(query, limit, &filter).await?;
+        let results = self.service.search_as(ctx, query, limit, &filter).await?;
 
         if results.is_empty() {
             return Ok(tool_text(
@@ -255,7 +263,7 @@ mod tests {
     async fn test_initialize_returns_capabilities() {
         let handler = make_handler();
         let req = make_request("initialize", Some(json!(1)), None);
-        let resp = handler.handle(req).await;
+        let resp = handler.handle(req, &CallContext::default()).await;
 
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], "2025-06-18");
@@ -271,7 +279,7 @@ mod tests {
             Some(json!(1)),
             Some(json!({"protocolVersion": "2024-11-05"})),
         );
-        let resp = handler.handle(req).await;
+        let resp = handler.handle(req, &CallContext::default()).await;
 
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], "2024-11-05");
@@ -281,7 +289,7 @@ mod tests {
     async fn test_ping_returns_empty_result() {
         let handler = make_handler();
         let req = make_request("ping", Some(json!(1)), None);
-        let resp = handler.handle(req).await;
+        let resp = handler.handle(req, &CallContext::default()).await;
 
         assert_eq!(resp.result, Some(json!({})));
         assert!(resp.error.is_none());
@@ -291,7 +299,7 @@ mod tests {
     async fn test_tools_list_returns_6_tools() {
         let handler = make_handler();
         let req = make_request("tools/list", Some(json!(2)), None);
-        let resp = handler.handle(req).await;
+        let resp = handler.handle(req, &CallContext::default()).await;
 
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
@@ -326,7 +334,7 @@ mod tests {
                 }
             })),
         );
-        let resp = handler.handle(req).await;
+        let resp = handler.handle(req, &CallContext::default()).await;
 
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
@@ -354,7 +362,7 @@ mod tests {
                 }
             })),
         );
-        handler.handle(store_req).await;
+        handler.handle(store_req, &CallContext::default()).await;
 
         // Now search
         let search_req = make_request(
@@ -368,7 +376,7 @@ mod tests {
                 }
             })),
         );
-        let resp = handler.handle(search_req).await;
+        let resp = handler.handle(search_req, &CallContext::default()).await;
 
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
@@ -394,7 +402,7 @@ mod tests {
                 "arguments": { "query": "anything" }
             })),
         );
-        let resp = handler.handle(req).await;
+        let resp = handler.handle(req, &CallContext::default()).await;
 
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
@@ -413,7 +421,7 @@ mod tests {
                 "arguments": {}
             })),
         );
-        let resp = handler.handle(req).await;
+        let resp = handler.handle(req, &CallContext::default()).await;
 
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
@@ -432,7 +440,7 @@ mod tests {
                 "arguments": { "title": "t", "tags": [] }
             })),
         );
-        let resp = handler.handle(req).await;
+        let resp = handler.handle(req, &CallContext::default()).await;
 
         let err = resp.error.unwrap();
         assert_eq!(err.code, INVALID_PARAMS);
@@ -450,7 +458,7 @@ mod tests {
                 "arguments": { "id": "20990101-nope", "title": "x" }
             })),
         );
-        let resp = handler.handle(req).await;
+        let resp = handler.handle(req, &CallContext::default()).await;
 
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
@@ -465,7 +473,7 @@ mod tests {
     async fn test_unknown_method() {
         let handler = make_handler();
         let req = make_request("something/weird", Some(json!(5)), None);
-        let resp = handler.handle(req).await;
+        let resp = handler.handle(req, &CallContext::default()).await;
 
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
@@ -488,7 +496,7 @@ mod tests {
                 }
             })),
         );
-        let resp = handler.handle(req).await;
+        let resp = handler.handle(req, &CallContext::default()).await;
 
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();

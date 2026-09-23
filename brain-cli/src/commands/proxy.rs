@@ -87,6 +87,8 @@ struct Upstream {
     consecutive_timeouts: AtomicU32,
     session_id: String,
     heartbeat_started: AtomicBool,
+    cwd: Option<String>,
+    caller_client: std::sync::Mutex<Option<String>>,
 }
 
 impl Upstream {
@@ -100,6 +102,10 @@ impl Upstream {
             consecutive_timeouts: AtomicU32::new(0),
             session_id: format!("{}-{}", std::process::id(), &generate_token()[..8]),
             heartbeat_started: AtomicBool::new(false),
+            cwd: std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned()),
+            caller_client: std::sync::Mutex::new(None),
         }
     }
 
@@ -234,16 +240,21 @@ impl Upstream {
         body: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, UpstreamError> {
-        let resp = self
+        let caller_client = self
+            .caller_client
+            .lock()
+            .expect("caller_client lock")
+            .clone();
+        let mut req = self
             .client
             .post(&state.http)
             .header("Content-Type", "application/json")
             .header(SESSION_HEADER, &self.session_id)
-            .bearer_auth(&state.token)
-            .body(body.to_vec())
-            .timeout(timeout)
-            .send()
-            .await;
+            .bearer_auth(&state.token);
+        for (name, value) in caller_headers(caller_client.as_deref(), self.cwd.as_deref()) {
+            req = req.header(name, value);
+        }
+        let resp = req.body(body.to_vec()).timeout(timeout).send().await;
 
         let resp = match resp {
             Ok(resp) => {
@@ -317,6 +328,26 @@ impl Upstream {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+}
+
+fn client_from_initialize(params: Option<&Value>) -> Option<String> {
+    let name = params?.get("clientInfo")?.get("name")?.as_str()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn caller_headers(
+    client: Option<&str>,
+    cwd: Option<&str>,
+) -> Vec<(&'static str, reqwest::header::HeaderValue)> {
+    [("X-Brain-Client", client), ("X-Brain-Cwd", cwd)]
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let value: String = value?.chars().take(256).collect();
+            reqwest::header::HeaderValue::from_str(&value)
+                .ok()
+                .map(|v| (name, v))
+        })
+        .collect()
 }
 
 struct OwnBuild {
@@ -481,6 +512,9 @@ async fn handle_line(line: String, upstream: Arc<Upstream>) -> Outcome {
 
     match request.method.as_str() {
         "initialize" => {
+            if let Some(name) = client_from_initialize(request.params.as_ref()) {
+                *upstream.caller_client.lock().expect("caller_client lock") = Some(name);
+            }
             let up = upstream.clone();
             tokio::spawn(async move {
                 if up.ensure().await.is_ok() {
@@ -903,6 +937,34 @@ mod tests {
         let resp = value_of(outcome);
         assert!(resp["error"].is_null());
         assert!(resp["result"]["isError"].is_null());
+    }
+
+    #[test]
+    fn client_from_initialize_cases() {
+        assert_eq!(
+            client_from_initialize(Some(&json!({
+                "clientInfo": {"name": "claude-code", "version": "2.1.3"}
+            }))),
+            Some("claude-code".to_string())
+        );
+        assert_eq!(
+            client_from_initialize(Some(&json!({"clientInfo": {"name": " codex "}}))),
+            Some("codex".to_string())
+        );
+        assert_eq!(
+            client_from_initialize(Some(&json!({"clientInfo": {"name": ""}}))),
+            None
+        );
+        assert_eq!(client_from_initialize(None), None);
+    }
+
+    #[test]
+    fn caller_headers_skips_invalid() {
+        let headers = caller_headers(Some("c"), Some("bad\ncwd"));
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, "X-Brain-Client");
+
+        assert!(caller_headers(None, None).is_empty());
     }
 
     #[test]

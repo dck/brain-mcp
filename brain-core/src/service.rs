@@ -7,15 +7,34 @@ use tracing::warn;
 use crate::config::default_categories;
 use crate::error::{BrainError, Result};
 use crate::id::generate_id;
-use crate::model::{Filter, IndexEntry, Memory, Metadata, SearchResult};
-use crate::ports::{EmbeddingPort, IndexPort, VaultPort};
+use crate::model::{
+    CallContext, Filter, IndexEntry, LoggedHit, Memory, Metadata, SearchLogEntry, SearchResult,
+    StoreLogEntry, StoreOutcome,
+};
+use crate::ports::{EmbeddingPort, IndexPort, LogPort, VaultPort};
 
 const DUPLICATE_THRESHOLD: f32 = 0.9;
+
+#[derive(Default)]
+struct StoreTrace {
+    memory_id: Option<String>,
+    neighbors: Vec<SearchResult>,
+}
+
+struct StoreInput {
+    title: String,
+    content: String,
+    tags: Vec<String>,
+    category: String,
+    project: Option<String>,
+    force: bool,
+}
 
 pub struct MemoryService {
     vault: Arc<dyn VaultPort>,
     embedder: Arc<dyn EmbeddingPort>,
     index: Arc<dyn IndexPort>,
+    log: Option<Arc<dyn LogPort>>,
     min_score: f32,
     categories: Vec<String>,
 }
@@ -30,6 +49,7 @@ impl MemoryService {
             vault,
             embedder,
             index,
+            log: None,
             min_score: 0.0,
             categories: default_categories(),
         }
@@ -45,6 +65,11 @@ impl MemoryService {
         self
     }
 
+    pub fn with_log(mut self, log: Arc<dyn LogPort>) -> Self {
+        self.log = Some(log);
+        self
+    }
+
     fn validate_category(&self, category: &str) -> Result<()> {
         if self.categories.iter().any(|c| c == category) {
             return Ok(());
@@ -53,6 +78,10 @@ impl MemoryService {
             category: category.to_string(),
             allowed: self.categories.clone(),
         })
+    }
+
+    async fn nearest(&self, embedding: &[f32], n: usize) -> Result<Vec<SearchResult>> {
+        self.index.search(embedding, n, &Filter::default()).await
     }
 
     pub async fn store(
@@ -64,12 +93,90 @@ impl MemoryService {
         project: Option<String>,
         force: bool,
     ) -> Result<Memory> {
+        self.store_as(
+            &CallContext::default(),
+            title,
+            content,
+            tags,
+            category,
+            project,
+            force,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_as(
+        &self,
+        ctx: &CallContext,
+        title: String,
+        content: String,
+        tags: Vec<String>,
+        category: String,
+        project: Option<String>,
+        force: bool,
+    ) -> Result<Memory> {
+        let (result, trace) = self
+            .store_inner(StoreInput {
+                title,
+                content,
+                tags,
+                category,
+                project,
+                force,
+            })
+            .await;
+        if let Some(log) = &self.log {
+            let outcome = match &result {
+                Ok(_) => StoreOutcome::Stored,
+                Err(BrainError::Duplicate { .. }) => StoreOutcome::DuplicateRejected,
+                Err(BrainError::AlreadyExists(_)) => StoreOutcome::IdConflict,
+                Err(_) => StoreOutcome::Error,
+            };
+            let entry = StoreLogEntry {
+                ts: Utc::now(),
+                ctx: ctx.clone(),
+                memory_id: trace.memory_id,
+                outcome,
+                forced: force,
+                neighbors: logged_hits(&trace.neighbors),
+                error: result
+                    .as_ref()
+                    .err()
+                    .filter(|_| outcome == StoreOutcome::Error)
+                    .map(|e| e.to_string()),
+            };
+            if let Err(e) = log.log_store(&entry).await {
+                warn!("store log write failed: {e}");
+            }
+        }
+        result
+    }
+
+    async fn store_inner(&self, input: StoreInput) -> (Result<Memory>, StoreTrace) {
+        let mut trace = StoreTrace::default();
+        let result = self.store_and_index(input, &mut trace).await;
+        (result, trace)
+    }
+
+    async fn store_and_index(&self, input: StoreInput, trace: &mut StoreTrace) -> Result<Memory> {
+        let StoreInput {
+            title,
+            content,
+            tags,
+            category,
+            project,
+            force,
+        } = input;
+
         self.validate_category(&category)?;
 
         let now = Utc::now();
         let id = generate_id(&title, now);
+        trace.memory_id = Some(id.clone());
 
         let embedding = self.embedder.embed(&content).await?;
+        trace.neighbors = self.nearest(&embedding, 3).await?;
 
         if !force {
             if self.vault.read(&id).await?.is_some() {
@@ -77,8 +184,7 @@ impl MemoryService {
                     "{id} — extend it with memory_update, or retry with force=true to overwrite"
                 )));
             }
-            let similar = self.index.search(&embedding, 1, &Filter::default()).await?;
-            if let Some(top) = similar.first()
+            if let Some(top) = trace.neighbors.first()
                 && top.score >= DUPLICATE_THRESHOLD
             {
                 return Err(BrainError::Duplicate {
@@ -110,6 +216,44 @@ impl MemoryService {
     }
 
     pub async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: &Filter,
+    ) -> Result<Vec<SearchResult>> {
+        self.search_as(&CallContext::default(), query, limit, filter)
+            .await
+    }
+
+    pub async fn search_as(
+        &self,
+        ctx: &CallContext,
+        query: &str,
+        limit: usize,
+        filter: &Filter,
+    ) -> Result<Vec<SearchResult>> {
+        let started = std::time::Instant::now();
+        let result = self.search_inner(query, limit, filter).await;
+        if let Some(log) = &self.log {
+            let entry = SearchLogEntry {
+                ts: Utc::now(),
+                ctx: ctx.clone(),
+                project: None,
+                query: query.to_string(),
+                filter: filter.clone(),
+                limit,
+                results: result.as_ref().map(|r| logged_hits(r)).unwrap_or_default(),
+                latency_ms: started.elapsed().as_millis() as u64,
+                error: result.as_ref().err().map(|e| e.to_string()),
+            };
+            if let Err(e) = log.log_search(&entry).await {
+                warn!("search log write failed: {e}");
+            }
+        }
+        result
+    }
+
+    async fn search_inner(
         &self,
         query: &str,
         limit: usize,
@@ -244,10 +388,22 @@ impl MemoryService {
     }
 }
 
+fn logged_hits(results: &[SearchResult]) -> Vec<LoggedHit> {
+    results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| LoggedHit {
+            id: r.memory.id.clone(),
+            rank: i + 1,
+            score: r.score,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mocks::{MockEmbedder, MockIndex, MockVault};
+    use crate::mocks::{MockEmbedder, MockIndex, MockLog, MockVault};
 
     fn make_service() -> (
         Arc<MockVault>,
@@ -1105,5 +1261,293 @@ mod tests {
         svc.update(&memory.id, Some("New Title".into()), None, None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_search_writes_log_row() {
+        let vault = Arc::new(MockVault::new());
+        let embedder = Arc::new(MockEmbedder::new(8));
+        let index = Arc::new(MockIndex::new());
+        let log = Arc::new(MockLog::new());
+        let svc = MemoryService::new(vault, embedder, index).with_log(log.clone());
+
+        let mem = svc
+            .store(
+                "Rust Lifetimes".into(),
+                "Lifetimes ensure references are valid".into(),
+                vec!["rust".into()],
+                "learnings".into(),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let ctx = CallContext {
+            client: Some("test/1".into()),
+            session_id: Some("s1".into()),
+            cwd: Some("/w/fitlake".into()),
+        };
+        svc.search_as(
+            &ctx,
+            "Lifetimes ensure references are valid",
+            7,
+            &Filter {
+                tags: Some(vec!["rust".into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let entries = log.searches();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.query, "Lifetimes ensure references are valid");
+        assert_eq!(entry.limit, 7);
+        assert_eq!(entry.filter.tags, Some(vec!["rust".to_string()]));
+        assert_eq!(entry.ctx, ctx);
+        assert_eq!(entry.results.len(), 1);
+        assert_eq!(entry.results[0].rank, 1);
+        assert_eq!(entry.results[0].id, mem.id);
+        assert!(entry.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_search_log_records_post_cutoff_results() {
+        let vault = Arc::new(MockVault::new());
+        let embedder = Arc::new(MockEmbedder::new(8));
+        let index = Arc::new(MockIndex::new());
+        let log = Arc::new(MockLog::new());
+        let svc = MemoryService::new(vault, embedder, index)
+            .with_min_score(0.99)
+            .with_log(log.clone());
+
+        svc.store(
+            "Rust Lifetimes".into(),
+            "Lifetimes ensure references are valid".into(),
+            vec![],
+            "learnings".into(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        svc.search("completely unrelated topic", 10, &Filter::default())
+            .await
+            .unwrap();
+
+        let entries = log.searches();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].results.is_empty());
+        assert!(entries[0].error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_store_logs_stored_with_neighbors() {
+        let vault = Arc::new(MockVault::new());
+        let embedder = Arc::new(MockEmbedder::new(64));
+        let index = Arc::new(MockIndex::new());
+        let log = Arc::new(MockLog::new());
+        let svc = MemoryService::new(vault, embedder, index).with_log(log.clone());
+
+        let a = svc
+            .store(
+                "Memory A".into(),
+                "Rust ownership and borrowing rules for memory safety".into(),
+                vec![],
+                "learnings".into(),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let b = svc
+            .store(
+                "Memory B".into(),
+                "A pasta carbonara recipe with eggs and pancetta".into(),
+                vec![],
+                "learnings".into(),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let entries = log.stores();
+        assert_eq!(entries.len(), 2);
+        let entry = &entries[1];
+        assert_eq!(entry.outcome, StoreOutcome::Stored);
+        assert_eq!(entry.memory_id, Some(b.id.clone()));
+        assert_eq!(entry.neighbors[0].id, a.id);
+        assert!(!entry.forced);
+    }
+
+    #[tokio::test]
+    async fn test_store_logs_duplicate_rejected() {
+        let vault = Arc::new(MockVault::new());
+        let embedder = Arc::new(MockEmbedder::new(8));
+        let index = Arc::new(MockIndex::new());
+        let log = Arc::new(MockLog::new());
+        let svc = MemoryService::new(vault, embedder, index).with_log(log.clone());
+
+        svc.store(
+            "Original".into(),
+            "identical content body".into(),
+            vec![],
+            "learnings".into(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let result = svc
+            .store(
+                "Different Title".into(),
+                "identical content body".into(),
+                vec![],
+                "learnings".into(),
+                None,
+                false,
+            )
+            .await;
+        assert!(result.is_err());
+
+        let entries = log.stores();
+        let entry = entries.last().unwrap();
+        assert_eq!(entry.outcome, StoreOutcome::DuplicateRejected);
+        assert!(entry.neighbors[0].score >= 0.9);
+        assert!(entry.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_store_logs_id_conflict() {
+        let vault = Arc::new(MockVault::new());
+        let embedder = Arc::new(MockEmbedder::new(8));
+        let index = Arc::new(MockIndex::new());
+        let log = Arc::new(MockLog::new());
+        let svc = MemoryService::new(vault, embedder, index).with_log(log.clone());
+
+        svc.store(
+            "Same Title".into(),
+            "first version".into(),
+            vec![],
+            "learnings".into(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let result = svc
+            .store(
+                "Same Title".into(),
+                "completely unrelated second version 12345".into(),
+                vec![],
+                "learnings".into(),
+                None,
+                false,
+            )
+            .await;
+        assert!(result.is_err());
+
+        let entries = log.stores();
+        let entry = entries.last().unwrap();
+        assert_eq!(entry.outcome, StoreOutcome::IdConflict);
+    }
+
+    #[tokio::test]
+    async fn test_store_forced_still_records_neighbors() {
+        let vault = Arc::new(MockVault::new());
+        let embedder = Arc::new(MockEmbedder::new(8));
+        let index = Arc::new(MockIndex::new());
+        let log = Arc::new(MockLog::new());
+        let svc = MemoryService::new(vault, embedder, index).with_log(log.clone());
+
+        svc.store(
+            "Original".into(),
+            "identical content body".into(),
+            vec![],
+            "learnings".into(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        svc.store(
+            "Different Title".into(),
+            "identical content body".into(),
+            vec![],
+            "learnings".into(),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let entries = log.stores();
+        let entry = entries.last().unwrap();
+        assert_eq!(entry.outcome, StoreOutcome::Stored);
+        assert!(entry.forced);
+        assert_eq!(entry.neighbors.len(), 1);
+    }
+
+    struct FailingLog;
+
+    impl LogPort for FailingLog {
+        fn log_search(&self, _entry: &SearchLogEntry) -> crate::ports::BoxFuture<'_, Result<()>> {
+            Box::pin(async { Err(BrainError::Index("boom".into())) })
+        }
+
+        fn log_store(&self, _entry: &StoreLogEntry) -> crate::ports::BoxFuture<'_, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn searches_since(
+            &self,
+            _since: chrono::DateTime<Utc>,
+        ) -> crate::ports::BoxFuture<'_, Result<Vec<SearchLogEntry>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn stores_since(
+            &self,
+            _since: chrono::DateTime<Utc>,
+        ) -> crate::ports::BoxFuture<'_, Result<Vec<StoreLogEntry>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_log_failure_does_not_fail_search() {
+        let vault = Arc::new(MockVault::new());
+        let embedder = Arc::new(MockEmbedder::new(8));
+        let index = Arc::new(MockIndex::new());
+        let svc = MemoryService::new(vault, embedder, index).with_log(Arc::new(FailingLog));
+
+        svc.store(
+            "Rust Lifetimes".into(),
+            "Lifetimes ensure references are valid".into(),
+            vec![],
+            "learnings".into(),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let results = svc
+            .search(
+                "Lifetimes ensure references are valid",
+                10,
+                &Filter::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
     }
 }

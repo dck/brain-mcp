@@ -157,6 +157,7 @@ brain-mcp recall     # print memory index (for SessionStart hooks)
 brain-mcp status     # show server status
 brain-mcp stop       # stop the server
 brain-mcp reindex    # rebuild search index from vault
+brain-mcp stats      # search/store usage from the local log
 ```
 
 ## Configuration
@@ -182,6 +183,8 @@ grace_period_seconds = 60
 ```
 
 Older configs may contain `backend = "sqlite-vec"`; it is still accepted and means the built-in SQLite index.
+
+The index database also keeps a local log of every search and store (query, filters, returned ids and scores, caller client/session/cwd). It never leaves your machine; `brain-mcp stats` summarizes it. Delete the `search_log`/`store_log` rows with `sqlite3` to clear it.
 
 ## Troubleshooting
 

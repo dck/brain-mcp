@@ -4,6 +4,7 @@ pub mod recall;
 pub mod reindex;
 pub mod serve;
 pub mod server_client;
+pub mod stats;
 pub mod status;
 pub mod stop;
 
